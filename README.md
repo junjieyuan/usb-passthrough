@@ -18,6 +18,7 @@
 | `usb-passthrough.service` | systemd 单元 |
 | `test_replay.py` | 回放事件日志验证状态机（不操作真实设备/VM） |
 | `sample-events.log` | 测试夹具 = `udev.log` + Razer 鼠标事件（含 8BitDo IDLE/active 切换） |
+| `docs/DESIGN.md` | **详尽设计文档与决策记录**（每条设计决策的 why，即代码的"why 注释"载体） |
 
 ## 安装
 
@@ -43,6 +44,8 @@ sudo dnf install python3-pyudev          # Arch: sudo pacman -S python-pyudev
 ```
 
 启动日志确认事件源：`event source: pyudev (libudev, kernel uevent socket)`。
+
+> 📖 每条设计决策背后的"为什么"（为什么用 DEVPATH 不用 DEVNUM、为什么去抖、为什么先清失效条目再直通、为什么 `LC_ALL=C`、为什么临时文件传 XML……）见 **`docs/DESIGN.md`**。
 
 VM 名不是 `windows` 的话，编辑 `/etc/systemd/system/usb-passthrough.service` 里注释掉的 `Environment=USB_PT_VM=...`。
 
