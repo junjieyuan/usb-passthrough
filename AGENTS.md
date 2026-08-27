@@ -11,7 +11,7 @@
 
 **核心设计理念**：
 - 事件驱动（秒级响应）+ 对账兜底（最终一致性，≤30s 收敛）
-- **状态未知时绝不动作**：`vm_running()` 返回 `None` 时宁可跳过等下次对账，绝不误 attach/detach
+- **状态未知时绝不动作**：`vm_snapshot()` 返回 `running=None` 时宁可跳过等下次对账，绝不误 attach/detach
 - 一切动作幂等、容错，靠对账收敛
 - 只动运行态（`--live`），不碰持久配置，与 virt-manager 分工
 
@@ -21,7 +21,7 @@
 
 | 文件 | 职责 |
 |---|---|
-| `usb-passthrough-daemon.py` | 主程序（单文件；Python 3 标准库 + `python3-pyudev`，唯一事件源） |
+| `usb-passthrough-daemon.py` | 主程序（单文件；Python 3 标准库 + `python3-pyudev`（唯一事件源）+ `python3-libvirt`（VM 动作层）） |
 | `test_replay.py` | 自包含回放测试（内嵌真实捕获事件，全 mock，**零外部依赖**） |
 | `usb-passthrough.service` | systemd 单元模板（`After=libvirtd`、`Restart=always`，需配 `Environment=`） |
 | `docs/DESIGN.md` | 设计文档：每条设计决策的 why、代码地图、领域知识、术语表 |
@@ -49,11 +49,13 @@
    - VM 状态未知时对账直接中止，等下次周期
    - 对账成功后需取消该设备残留的 settle 定时器，避免 detach+attach 抖动
 
-6. **libvirt 调用规范**：
-   - 所有 `virsh` 调用强制 `LC_ALL=C`（否则中文 locale 输出 `运行`，`running` 比较失败）
-   - XML 必须写临时文件再传给 virsh（实测该版本不认 `-` 标准输入）
+6. **libvirt 调用规范**（python3-libvirt 绑定，无 virsh 子进程）：
+   - **短生命期连接**：每次调用 `_open()` 现开现关（查询 `openReadOnly`、attach/detach 读写连接，均带 keepalive——挂死的 libvirtd 快速失败不卡 select 循环；contextmanager `_conn()` 负责关闭），libvirtd 重启在下一次调用天然自愈；连接失败 = 状态未知 → 返回 `None`/`False`，等对账
+   - **keepalive 前提**：模块导入时必须先 `libvirt.virEventRegisterDefaultImpl()`，否则每次连接 stderr 刷 "caller doesn't support keepalive protocol" 且 keepalive 失效
+   - **状态+配置一次读完**：查询统一走 `vm_snapshot()` → `(running, attached)`（单只读连接；配置 = `dom.XMLDesc(0)` + `_parse_hostdev_map` 解析），调用方把 attached map 传下去共享，禁止每设备重读配置
+   - `import libvirt` 守卫导入（测试环境无库也能加载模块），`run()` 里缺失拒绝启动；**版本必须与 libvirtd 配对，用发行版包装，禁 pip**
    - hostdev XML **只按 vendor/product 匹配，不加 `<address>`**（宿主侧地址绑定 DEVNUM，重枚举必失效）
-   - 只用 `--live`（不碰持久配置，与 virt-manager 各管一摊：开机直通归持久配置，运行期恢复归守护进程）
+   - 只用 `--live`（绑定对应 `VIR_DOMAIN_AFFECT_LIVE`，不碰持久配置，与 virt-manager 各管一摊：开机直通归持久配置，运行期恢复归守护进程）
 
 7. **配置**：**全部来自环境变量，代码零硬编码设备/VM 名**。`USB_PT_VM` 与 `USB_PT_ALLOWED` 必填，缺失拒绝启动（非零退出）。
 
@@ -71,7 +73,7 @@ python3 test_replay.py
 ```
 
 - CI（`.github/workflows/test.yml`）在 push/PR 时自动执行上述两步，PR 必须全绿。
-- `test_replay.py` 不需要 pyudev/libvirt：import 前固顶环境变量、mock 掉 `vm_running`/`vm_attached_devices`/`scan_physical_devices`/`attach_device`/`detach_device`/`devpath_present`/`time`，回放内嵌的真实事件流并断言状态机行为。
+- `test_replay.py` 不需要 pyudev/libvirt：import 前固顶环境变量、mock 掉 `vm_snapshot`/`scan_physical_devices`/`attach_device`/`detach_device`/`devpath_present`/`time`，回放内嵌的真实事件流并断言状态机行为。
 - 回放循环顺序固定：**先 `fire_timers()` 再更新 fake sysfs 再 `handle_event()`**，不能反（settle/去抖判定依赖定时器先于事件生效）。
 - 新增断言场景：要么往 `EVENTS` 加事件流（时间戳决定 settle/去抖时序，须与真实行为一致），要么做定向场景测试（参考既有 "stale-entry recovery"/"reconcile stale-address"/"reconcile unreadable VM config" 专项块）。
 - 对账类测试须先把 `d.pyudev` mock 成非 None（`reconcile()` 开头有 pyudev 守卫）。
@@ -98,9 +100,11 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 |---|---|
 | 用 DEVNUM 匹配设备 | DEVPATH + vid/pid |
 | 处理 `change`/`bind` 当插入 | 只处理 add/remove |
-| 依赖非英文 locale 的 virsh 输出 | 强制 `LC_ALL=C` |
-| 用 `-` 把 XML 传给 virsh | 写临时文件 |
-| 把 `vm_running()` 的 `None` 当"没运行" | `None` = 状态未知，绝不动作 |
+| pip 装 python3-libvirt | 用发行版包（版本必须与 libvirtd 配对） |
+| 缓存 libvirt 连接跨 libvirtd 重启 | 短连接现开现关，失败当"状态未知" |
+| 以为 python 绑定暴露 `listHostdevs`（C API 5.7 起有） | 实测无该属性（libvirtd 12.0.0）——用 `XMLDesc(0)` + 解析 |
+| 没注册事件循环就 `setKeepAlive` | 导入时 `virEventRegisterDefaultImpl()`，否则每次连接 stderr 刷错且 keepalive 失效 |
+| 把 `vm_snapshot()` 的 `running=None` 当"没运行" | `None` = 状态未知，绝不动作 |
 | 对账只看"设备在不在 VM 配置" | 必须做地址比对，检测失效条目 |
 | 写死默认 VM 名/设备 | 只从环境变量读，必填缺失拒绝启动 |
 | 用 pyudev 的 `dev.get()` | 用 `dev.properties.get()`（0.24.1 起弃用） |

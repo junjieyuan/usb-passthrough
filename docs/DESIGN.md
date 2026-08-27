@@ -37,7 +37,8 @@
                         │   attach_device() / detach_device()         │
                         └───────────────┬──────────────────────────┘
                                         ▼
-                              virsh attach/detach-device
+                        python3-libvirt 绑定 (attachDeviceFlags /
+                        detachDeviceFlags / state / XMLDesc)
                                         │
                                         ▼
                               libvirt (qemu:///system) → QEMU → VM (guest)
@@ -51,7 +52,7 @@
 | `Daemon` 状态机 | 事件 → 决策（是否/何时 attach/detach），持有设备状态表 + 定时器 |
 | 定时器 | settle（attach 前等待）、去抖（remove 后确认） |
 | 对账 reconcile | 周期性地把"物理设备清单"与"VM 配置清单"对齐，自愈一切漏网之鱼 |
-| libvirt 动作层 | 通过 `virsh` 执行 attach/detach，全部幂等、容错 |
+| libvirt 动作层 | 通过 **python3-libvirt 绑定**执行 attach/detach/查询，全部幂等、容错 |
 
 **为什么是"事件驱动 + 对账兜底"双保险（最重要的设计原则）**：
 
@@ -63,7 +64,7 @@
 
 ## 3. 核心设计原则
 
-1. **状态未知时绝不动作**：`virsh domstate` 失败（libvirt 未运行）返回 `None`，调用方必须把 `None` 当作"不知道"而不是"没运行"——宁可跳过动作等下次对账，也绝不错 detach 设备。
+1. **状态未知时绝不动作**：读 VM 状态失败（libvirt 不可用/未运行）返回 `None`，调用方必须把 `None` 当作"不知道"而不是"没运行"——宁可跳过动作等下次对账，也绝不错 detach 设备。
 2. **一切动作幂等**：attach 前先查 VM 当前配置，已挂就跳过（或先清失效条目再挂）；detach 容忍"设备已不存在"。
 3. **对账是最终仲裁者**：任何事件路径的失败/遗漏，最终由 reconcile 收敛。
 4. **守护进程只做运行期恢复，不碰持久配置**：开机直通归持久配置（如 virt-manager），运行时恢复归守护进程（见第 9 节）。
@@ -131,7 +132,7 @@
 - 期间/之后同一 `DEVPATH` 重新出现 → 判定为"重枚举/模式切换"，**跳过 detach**（避免无谓的取消再直通抖动）；
 - 端口持续消失 → 确认是真拔 → 执行 detach。
 
-**为什么 detach 对"设备已消失"容错**：物理 remove 时 QEMU 早已自己把设备摘了（usbfs 句柄失效），`virsh detach-device` 可能失败或空操作——这是正常情况，记日志继续，不能崩、不能重试卡死。
+**为什么 detach 对"设备已消失"容错**：物理 remove 时 QEMU 早已自己把设备摘了（usbfs 句柄失效），detach 调用可能失败或空操作——这是正常情况，记日志继续，不能崩、不能重试卡死。
 
 **注意**：某些设备（如鼠标的蓝牙↔2.4G 开关）切换**不产生任何 udev 事件**（dongle 始终保持枚举）。这类设备切换时守护进程什么都做不了也不需要做——这是物理行为，不是守护进程的职责。
 
@@ -145,7 +146,7 @@
 
 ### 6.5 幂等
 
-attach 前查 `dumpxml`（已在配置 → 清失效 → 重挂）；detach 前也查（不在配置 → 跳过）。保证重复事件、对账与事件并发时都不会重复动作。
+attach 前查 VM live 配置（`vm_snapshot()` 的 attached map，已在配置 → 清失效 → 重挂）；detach 前也查（不在配置 → 跳过）。保证重复事件、对账与事件并发时都不会重复动作。
 
 ### 6.6 定时器实现
 
@@ -155,7 +156,7 @@ attach 前查 `dumpxml`（已在配置 → 清失效 → 重挂）；detach 前�
 
 ## 7. 对账（reconcile）
 
-**做什么**：每 30 秒 + 启动时，把 `scan_physical_devices()`（当前物理允许设备，含 bus/device）与 `vm_attached_devices()`（VM live XML 里的 hostdev，含 libvirt 记录解析地址）求差集：
+**做什么**：每 30 秒 + 启动时，把 `scan_physical_devices()`（当前物理允许设备，含 bus/device）与 `vm_snapshot()` 的 attached map（VM live XML 里的 hostdev，含 libvirt 记录解析地址）求差集：
 
 - 物理在、VM 没有 → attach；
 - VM 有、物理不在（且允许清单内）→ detach（清僵尸条目）；
@@ -172,7 +173,7 @@ attach 前查 `dumpxml`（已在配置 → 清失效 → 重挂）；detach 前�
 
 **为什么对账也是最终仲裁者**：任何事件路径的失败（attach 失败、detach 容错跳过、事件丢失），最终 30 秒内会被对账收敛到正确状态。
 
-**为什么"VM 状态未知时对账直接中止"**：`domstate` 失败 = 无法确认 VM 状态，此时 attach/detach 都可能产生错误副作用，宁可中止等下次。
+**为什么"VM 状态未知时对账直接中止"**：读 VM 状态失败（libvirt 不可用）= 无法确认 VM 状态，此时 attach/detach 都可能产生错误副作用，宁可中止等下次。
 
 **手动触发即时对账**：收到 `SIGHUP` 信号后，守护进程用一个零延时、同 key 的对账定时器替换既定计划（`set_timer` 同 key 去重），在下一个事件循环迭代（≤0.5s）内立即执行一次对账（`sudo systemctl kill -s HUP usb-passthrough`），不需要等 30s 周期——用于部署验证或紧急恢复。
 
@@ -195,9 +196,28 @@ attach 前查 `dumpxml`（已在配置 → 清失效 → 重挂）；detach 前�
 
 **为什么不加 `<address>`**：宿主侧地址（`<source><address bus=.. device=../>`）绑定 DEVNUM，重枚举必失效；且 libvirt 按 XML 记账，vendor/product 匹配时**物理设备已消失也能正常 detach**（匹配的是配置条目而不是设备）。
 
-### 8.2 临时文件传 XML（踩坑修复）
+### 8.2 用 python3-libvirt 绑定，而非 virsh 子进程
 
-**为什么不用 `-` 标准输入**：实测该 virsh 版本**不认 `-`**，会把 `-` 当文件名去 open（报"打开文件 '-' 失败"）。所以 attach/detach 都把 XML 写进 `/tmp` 临时文件传给 virsh，用完即删。
+**为什么弃用 virsh**（历史实现是 `subprocess.run(["virsh", ...])`）：
+
+| virsh 子进程的问题 | 绑定的解法 |
+|---|---|
+| 输出文本解析（`domstate`、stderr）脆弱，旧实现靠 `LC_ALL=C` 兜底本地化坑 | 结构化 API：`dom.state()[0]` 直接是枚举值，`libvirtError` 带错误码 |
+| XML 必须写临时文件传（此前实测该 virsh 版本把 `-` 当文件名 open） | `attachDeviceFlags(xml, ...)` / `detachDeviceFlags(xml, ...)` 直接收 XML **字符串** |
+| 每次动作一个子进程 + 依赖 `virsh` 二进制在 PATH | 进程内 C 绑定调用 |
+
+**API 对应关系**（行为完全等价；状态机决策逻辑与 virsh 时代零差异）：
+
+- `virsh domstate` → `dom.state()[0] == libvirt.VIR_DOMAIN_RUNNING`（`vm_snapshot()` 的 running 部分）
+- `virsh dumpxml` → `dom.XMLDesc(0)` + 同款 regex 解析 hostdev（`_parse_hostdev_map`）：运行中域给 live XML，解析到的 `<source><address>` 与 virsh 完全一致——§7 地址比对的数据来源；唯一变化是 XML 字符串由绑定直接返回，不再经过 virsh 子进程
+- `virsh attach-device --live` → `dom.attachDeviceFlags(xml, libvirt.VIR_DOMAIN_AFFECT_LIVE)`
+- `virsh detach-device --live` → `dom.detachDeviceFlags(xml, libvirt.VIR_DOMAIN_AFFECT_LIVE)`
+
+**为什么不用 `virDomainListHostdevs` 的类型化包装（实测决策记录）**：C API 自 5.7 起提供 `virDomainListHostdevs(sane=1)`——本意正是取代"dumpxml + 自己解析地址"。但 **python 绑定并不暴露它**：作者真机实测（libvirtd 12.0.0 + 发行版 python3-libvirt）报 `'virDomain' object has no attribute 'listHostdevs'`。因此 regex 解析 live XML 是绑定可见的唯一路径，保留（解析器隔离在 `_parse_hostdev_map()` 一处，若未来绑定补齐该 API 可换回）。
+
+**为什么模块顶部 `import libvirt` 是 try/except**：与 pyudev 同理由（§4）——仅保证没装 libvirt 的机器（CI 回放测试）仍能加载模块；`run()` 里检查、缺失拒绝启动。这不是回退。
+
+**版本配对**：python3-libvirt 版本必须与 libvirtd 配对，**必须用发行版包安装**（Fedora 系 `rpm-ostree install python3-libvirt`），严禁 pip 单装（版本错配会 ABI 报错）。
 
 ### 8.3 `managed='yes'`
 
@@ -205,15 +225,26 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 ### 8.4 只用 `--live`（非持久）
 
-**为什么**：持久配置属于 virt-manager（开机直通靠它）；守护进程只动运行态，VM 重启后持久配置照常生效，两者互不干扰、不会打架。
+**为什么**：持久配置属于 virt-manager（开机直通靠它）；守护进程只动运行态，VM 重启后持久配置照常生效，两者互不干扰、不会打架。绑定里对应 `attachDeviceFlags`/`detachDeviceFlags` 的 `VIR_DOMAIN_AFFECT_LIVE` 标志——与 `virsh --live` 是同一个标志位。
 
-### 8.5 `LC_ALL=C`（踩坑修复）
+### 8.5 短生命期连接（每次调用新建，不缓存）
 
-**为什么**：virsh 会本地化输出——实测中文 locale 下 `virsh domstate <vm>` 返回 `运行` 而不是 `running`，字符串比较失败导致误判"VM not running"。所有 `_sh()` 调用统一强制 `LC_ALL=C`，状态名和错误信息都稳定为英文，也方便对日志。
+**为什么**：libvirtd 重启后旧连接会失效，缓存连接就得自己写"断线检测 + 重连"逻辑。每次动作现开现关（`_open()`：查询用 `openReadOnly`，attach/detach 用读写连接），libvirtd 重启天然在**下一次调用**自愈——正好落在"状态未知 → 跳过 → 对账重试"的既有框架里，无需任何重连代码。
 
-### 8.6 状态语义
+**为什么补 keepalive**（`conn.setKeepAlive(5, 3)`）：绑定是同步 RPC、无超时参数——virsh 时代 `subprocess.run` 有 15s timeout，libvirtd 假死时绑定调用会无限阻塞导致 select 循环卡死。keepalive 让死连接在几轮探测后报错返回（≈15s 内），恢复与 virsh 时代等同的"最坏阻塞上限"。
 
-`vm_running()` 返回三值：`True`/`False`/`None`（无法确定）。`None` 绝不是 `False`——第 3 节原则 1。
+**前提（实测踩坑）**：必须先注册事件循环实现 `libvirt.virEventRegisterDefaultImpl()`（模块导入时执行一次；内置 poll 实现，单线程下随阻塞 RPC 运转），否则 setKeepAlive 报 `the caller doesn't support keepalive protocol`、keepalive 失效，且 **每次连接** libvirt 都向 stderr 刷一遍该错误。
+
+### 8.6 状态与配置一次读完（`vm_snapshot()`）
+
+`vm_running()` + `vm_attached_devices()` 合并为 `vm_snapshot() -> (running, attached)`：**单只读连接**一次取 `dom.state()` + `dom.XMLDesc(0)`（仅 VM 运行中才读配置——VM 关闭时配置与决策无关，省一次 RPC）。两个用途（决策运行态、比对配置）的调用点几乎所有场景都同时需要两者，合并后从 2 次连接握手降为 1 次。
+
+失败语义保持**两维独立**（都可单独返回 `None`）：
+
+- `running=None`（状态未知）绝不是 `False`——第 3 节原则 1；
+- `attached=None`（配置读不到）单独让调用方安全中止。
+
+**为什么对账共享同一份 attached map**：对账一次 pass 内配置不会自变（变的只有本进程自己的动作），开头读一次传给 `_heal_attach` 复用，消灭"每设备重读一遍配置"的 N+1 冗余；事件路径（`bus=None`）仍以快照为准、语义不变。
 
 ---
 
@@ -233,7 +264,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 ## 10. 真机踩坑记录（通用）
 
-本仓库踩过的全部真坑（locale 误判、virsh 临时文件、对账竞态×2、dumpxml 失败防护等）与正确做法已合并为**单一权威表**，见 [DEVELOPMENT.md §6](./DEVELOPMENT.md)——这里不再重复维护一份。
+本仓库踩过的全部真坑（含 virsh 时代的 locale 误判、临时文件传 XML，以及新版 libvirt 绑定的版本配对等）与正确做法已合并为**单一权威表**，见 [DEVELOPMENT.md §6](./DEVELOPMENT.md)——这里不再重复维护一份。
 
 ---
 
@@ -241,7 +272,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 **为什么需要自动化验证**：守护进程的行为（去抖、settle、重枚举判断）用真机验证成本高且不可重复，必须用真实数据锁定行为。
 
-1. **回放测试 `test_replay.py`**：把**内嵌在代码里的真实捕获事件**（部署时用 `udevadm monitor` 在真实硬件上采集，**零文件依赖**）按时间戳回放进状态机，mock 掉 virsh 和 sysfs，断言多项行为（attach/detach/不抖动/非允许清单设备无动作/stale 条目先清再挂/对账地址失配恢复/VM 配置不可读安全中止等）。零副作用、可重复、CI 友好。具体断言清单见 `docs/DEVELOPMENT.md`。
+1. **回放测试 `test_replay.py`**：把**内嵌在代码里的真实捕获事件**（部署时用 `udevadm monitor` 在真实硬件上采集，**零文件依赖**）按时间戳回放进状态机，mock 掉 libvirt 和 sysfs，断言多项行为（attach/detach/不抖动/非允许清单设备无动作/stale 条目先清再挂/对账地址失配恢复/VM 配置不可读安全中止等）。零副作用、可重复、CI 友好。具体断言清单见 `docs/DEVELOPMENT.md`。
 2. **集成冒烟**：只读扫描真实 sysfs（容器共享宿主 /sys），验证 `scan_physical_devices()`/`devpath_present()`/事件解析与真实设备数据吻合。
 3. **真机验收**：VM 运行中逐项验证无线切换、开关机、VM 关机释放（本项目作者的真实验收记录见 `docs/AUTHOR_DEPLOYMENT.md`）。
 
@@ -295,13 +326,13 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 | 函数 | 职责 / 关键点 |
 |---|---|
-| `_sh(cmd, ...)` | subprocess 包装；**强制 `LC_ALL=C`**（§8.5）；`FileNotFoundError`/`TimeoutExpired` → 返回 `None`；返回 `CompletedProcess` 或 `None` |
-| `vm_running()` | 三态：`True`/`False`/`None`（§8.6）；非 running 时打印 `VM ... state is ...` 诊断日志 |
-| `_xml_tempfile(xml)` | 写临时 XML 文件（§8.2，virsh 不认 `-`）；异常时清理 |
+| `_open(readonly)` | **短生命期连接**（§8.5）：现开现关，libvirtd 重启在下一次调用自愈；查询走 `openReadOnly`，attach/detach 走读写连接；带 keepalive 防阻塞；bindings 缺失/libvirtd 不可达 → `None`（= 状态未知） |
+| `_conn(readonly)` | contextmanager 包装 `_open()`：with 块结束担保 `close()`；连接开失败时 yield `None` |
+| `vm_snapshot()` | **单只读连接**返回 `(running, attached)`（§8.6）：`dom.state()[0]==VIR_DOMAIN_RUNNING` + `dom.XMLDesc(0)`（仅运行中读配置）；两维失败独立返回 `None`；非 running 打印 `VM ... not running (state=...)` |
+| `_parse_hostdev_map(xml)` | 正则解析 live XML 的 hostdev → **`{(vid,pid): (bus,device) 或 None}`**；地址从 `<source>` 里提取，是对账地址比对（§7）的数据来源；为什么不用 `virDomainListHostdevs` 类型化包装见 §8.2（python 绑定未暴露，实测决策记录） |
 | `hostdev_xml(vid,pid)` | 生成 vendor/product-only 的 hostdev XML（§8.1） |
-| `vm_attached_devices()` | **返回 `{(vid,pid): (bus,device) 或 None}`**；地址从 `<source>` 里提取——这是对账地址比对（§7）的数据来源 |
-| `attach_device(vid,pid)` | 重试 `ATTACH_RETRIES` 次、间隔 `ATTACH_RETRY_GAP`；成功返回 `True` |
-| `detach_device(vid,pid)` | 单次、**容错**（设备已消失/条目已不在视为正常，记日志返回 `False`） |
+| `attach_device(vid,pid)` | `attachDeviceFlags(xml, VIR_DOMAIN_AFFECT_LIVE)`（§8.2）；重试 `ATTACH_RETRIES` 次、间隔 `ATTACH_RETRY_GAP`；成功返回 `True` |
+| `detach_device(vid,pid)` | `detachDeviceFlags(xml, VIR_DOMAIN_AFFECT_LIVE)`；单次、**容错**（设备已消失/条目已不在视为正常，记日志返回 `False`） |
 
 ### 14.3 sysfs 层
 
@@ -320,13 +351,13 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 | `_reconcile_tick` | 一次对账（异常隔离）+ 自续期调度下一轮；也是 SIGHUP 手动触发的入口 |
 | `handle_event(ev)` | 入口：校验 DEVTYPE / 解析 PRODUCT / hub 过滤 → 只分派 `add`/`remove`（§6.1） |
 | `on_add` | 置 present → 非白名单短路 → 调度 settle 定时器（§6.2） |
-| `attach_if_needed` | settle 到期执行：present + 物理存在 + VM 运行 → 调 `_heal_attach` |
-| `_heal_attach` | 事件/对账共享的「失效判定 → 先清再挂 → 清 settle 定时器」：事件路径（无地址）有残留条目即失效；对账路径按地址比对，记录地址缺失时保守视为健康（§6.4/§7） |
-| `_detach_if_listed` | 「VM 配置里还列着该设备就 detach」的共享助手（未跟踪设备的 remove 即时清理与 `maybe_detach` 兜底共用） |
-| `on_remove` | 未跟踪设备即时清理（查配置）→ 已知设备置 present=False 并调度去抖（§6.3） |
+| `attach_if_needed` | settle 到期执行：present + 物理存在 + `vm_snapshot()` 运行 → 调 `_heal_attach`（附快照的 attached map，§8.6） |
+| `_heal_attach` | 事件/对账共享的「失效判定 → 先清再挂 → 清 settle 定时器」：事件路径（无地址）有残留条目即失效；对账路径按地址比对，记录地址缺失时保守视为健康（§6.4/§7）；attached map 由调用方传入复用 |
+| `_detach_if_listed` | 「VM 配置里还列着该设备就 detach」的共享助手（未跟踪设备的 remove 即时清理与 `maybe_detach` 兜底共用；接收调用方的 attached map） |
+| `on_remove` | 未跟踪设备即时清理（`vm_snapshot()` 查配置）→ 已知设备置 present=False 并调度去抖（§6.3） |
 | `maybe_detach` | 去抖到期执行：端口重现=重枚举跳过；VM 未知留给对账；真拔 → detach |
 | `reconcile` | 三动作：补 attach（经 `_heal_attach`）/ 清僵尸；附内存卫生（§7） |
-| `run` | pyudev 检查 → monitor 初始化 → **启动即对账**（`_reconcile_tick`）→ select 循环（排空事件 / 定时器） |
+| `run` | pyudev + libvirt 检查（缺失拒绝启动）→ monitor 初始化 → **启动即对账**（`_reconcile_tick`）→ select 循环（排空事件 / 定时器） |
 
 ### 14.5 入口 `main`
 
@@ -365,7 +396,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 - 设备物理消失后，live XML 条目**不会自动移除** → 变成失效条目（stale entry）；QEMU 侧设备已死、guest 已丢设备；
 - libvirt **不会**在设备重枚举后自动恢复——这正是本项目存在的理由（virt-manager 持久直通也依赖同一机制，同样不会恢复）；
 - `managed='yes'`：libvirt 自动处理宿主驱动解绑/回绑；
-- `--live` 只动运行态；持久配置（virt-manager）在 VM 启动时生效——两者分工见 §9。
+- `--live` 只动运行态（绑定里即 `VIR_DOMAIN_AFFECT_LIVE` 标志位）；持久配置（virt-manager）在 VM 启动时生效——两者分工见 §9。
 
 ---
 

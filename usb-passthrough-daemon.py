@@ -10,9 +10,12 @@ A periodic reconciliation heals missed events (service restarts, host
 suspend/resume, devices already present when the VM started).
 
 Event source: pyudev (libudev) — a native kernel-uevent monitor, no
-subprocess, no fallback. Only kernel-level properties are used
-(PRODUCT / TYPE / DEVTYPE / DEVPATH), so the kernel socket is sufficient.
-Requires python3-pyudev; the daemon refuses to start without it.
+fallback. Only kernel-level properties are used (PRODUCT / TYPE /
+DEVTYPE / DEVPATH), so the kernel socket is sufficient. VM actions
+(attach/detach/state queries) go through the libvirt python bindings —
+no virsh subprocess.
+Requires python3-pyudev and python3-libvirt; the daemon refuses to start
+without either.
 
 Design decisions (rationale in docs/DESIGN.md):
     * identity  = PRODUCT=vid/pid/rev (present on both add AND remove events)
@@ -34,10 +37,9 @@ import os
 import re
 import select
 import signal
-import subprocess
 import sys
-import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable
 
@@ -47,6 +49,24 @@ try:
     import pyudev  # noqa: F401
 except ImportError:
     pyudev = None
+
+# python3-libvirt drives the VM action layer (state queries, attach/detach).
+# Guarded import like pyudev: tests can load this module without it; the
+# daemon refuses to start without it. Version must pair with the running
+# libvirtd (install via the distro package, not pip).
+try:
+    import libvirt  # noqa: F401
+except ImportError:
+    libvirt = None
+else:
+    # Without a registered event-loop implementation setKeepAlive() fails
+    # with "the caller doesn't support keepalive protocol" (libvirt also
+    # logs it to stderr on EVERY connection). The default impl is poll-based
+    # and runs inside blocking RPCs — right for this single-threaded daemon.
+    try:
+        libvirt.virEventRegisterDefaultImpl()
+    except libvirt.libvirtError:
+        pass  # registration failed: keepalive gets skipped in _open()
 
 # ---------------------------------------------------------------------------
 # Types
@@ -109,8 +129,6 @@ RECONCILE_SEC = _env_int("USB_PT_RECONCILE", 30)
 ATTACH_RETRIES = _env_int("USB_PT_ATTACH_RETRIES", 3)
 ATTACH_RETRY_GAP = _env_int("USB_PT_ATTACH_RETRY_GAP", 2)
 
-VIRSH = ["virsh"]
-
 
 def is_allowed(vid: int, pid: int) -> bool:
     return (vid, pid) in ALLOWED
@@ -120,75 +138,99 @@ def is_allowed(vid: int, pid: int) -> bool:
 # libvirt helpers
 # ---------------------------------------------------------------------------
 
-def _sh(cmd: list[str], timeout: float = 15,
-        **kw: object) -> subprocess.CompletedProcess | None:
-    # C locale so virsh state names / error strings are stable English
-    kw.setdefault("env", {**os.environ, "LC_ALL": "C"})
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, **kw)
-    except FileNotFoundError:
-        log.error("command not found: %s", cmd[0])
-        return None
-    except subprocess.TimeoutExpired:
-        log.error("command timed out: %s", " ".join(cmd))
-        return None
+def _open(readonly: bool = False):
+    """Open a short-lived connection to the default hypervisor
+    (same URI resolution as virsh, i.e. qemu:///system as root).
 
-
-def vm_running() -> bool | None:
-    """Return True/False, or None when the state cannot be determined.
-
-    Callers must never treat None as "not running": on an unknown state we
-    skip the action and let the periodic reconcile retry later.
+    A fresh connection per call, never cached: libvirtd restarts are then
+    healed naturally by the next call instead of needing reconnect logic.
+    Queries use read-only connections; attach/detach need read-write.
+    Returns None when the bindings are missing or libvirtd is unreachable —
+    callers treat that as unknown state and skip (reconcile retries later).
     """
-    r = _sh(VIRSH + ["domstate", VM_NAME])
-    if r is None or r.returncode != 0:
+    if libvirt is None:
+        log.error("python3-libvirt unavailable")
         return None
-    state = r.stdout.strip()
-    if state != "running":
-        log.info("VM %s state is %r (not running)", VM_NAME, state)
-    return state == "running"
-
-
-def _xml_tempfile(xml: str) -> str:
-    """Write hostdev XML to a temp file (virsh needs a real path, not '-')."""
-    fd, path = tempfile.mkstemp(prefix="usb-pt-", suffix=".xml")
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(xml)
-    except Exception:
-        os.unlink(path)
-        raise
-    return path
+        opener = libvirt.openReadOnly if readonly else libvirt.open
+        conn = opener(None)
+        # dead-peer detection for blocking RPCs: error out within a few
+        # keepalive rounds instead of letting a hung libvirtd stall the
+        # select loop forever (mirrors the old virsh subprocess timeout)
+        try:
+            conn.setKeepAlive(5, 3)
+        except (libvirt.libvirtError, AttributeError):
+            pass  # very old libvirt without keepalive: accept the risk
+        return conn
+    except libvirt.libvirtError as e:
+        log.error("libvirt connection failed: %s", e)
+        return None
 
 
-def hostdev_xml(vid: int, pid: int) -> str:
-    # match by vendor/product only — deliberately NO <address>: a host-side
-    # address binds DEVNUM, which changes on every re-enumeration
-    return (
-        "<hostdev mode='subsystem' type='usb' managed='yes'>\n"
-        "  <source>\n"
-        f"    <vendor id='0x{vid:04x}'/>\n"
-        f"    <product id='0x{pid:04x}'/>\n"
-        "  </source>\n"
-        "</hostdev>\n"
-    )
+@contextmanager
+def _conn(readonly: bool = False):
+    """With-block wrapper around _open(): guarantees close() on the way
+    out. Yields None when the connection could not be opened."""
+    c = _open(readonly)
+    try:
+        yield c
+    finally:
+        if c is not None:
+            c.close()
 
 
-def vm_attached_devices() -> AttachedMap | None:
-    """Return {(vid,pid): (host bus, host device) or None} for USB hostdevs
-    in the VM's live config; None on error.
+def vm_snapshot() -> tuple[bool | None, AttachedMap | None]:
+    """One read-only connection: (VM running?, USB hostdevs in live config).
 
-    The address is libvirt's resolution of the device at attach time.
-    Comparing it with the device's current bus/device numbers reveals
+    running is True/False/None — None means the state could not be
+    determined and must NEVER be treated as "not running": skip the action,
+    reconcile retries later. attached is {(vid,pid): (host bus, host device)
+    or None} for USB hostdevs, or None when the config could not be read
+    (only fetched while the VM runs; unused by callers otherwise). The two
+    failure modes stay distinct so callers can abort on either.
+
+    The address in the map is libvirt's resolution of the device at attach
+    time. Comparing it with the device's current bus/device numbers reveals
     re-enumerations: the VM entry is stale and the guest already lost
     the device.
     """
-    r = _sh(VIRSH + ["dumpxml", VM_NAME])
-    if r is None or r.returncode != 0:
-        return None
+    with _conn(readonly=True) as conn:
+        if conn is None:
+            return None, None
+        try:
+            dom = conn.lookupByName(VM_NAME)
+            state = dom.state()[0]
+        except libvirt.libvirtError as e:
+            log.error("cannot read state of VM %s: %s", VM_NAME, e)
+            return None, None
+        running = state == libvirt.VIR_DOMAIN_RUNNING
+        if not running:
+            log.info("VM %s not running (state=%s)", VM_NAME, state)
+            # config stays unread: it is irrelevant while the VM is off and
+            # no caller consumes the map in that case
+            return running, {}
+        try:
+            # flags=0 gives the live XML for a running domain, exactly like
+            # `virsh dumpxml` (the resolved <address> lands in <source>)
+            xml = dom.XMLDesc(0)
+        except libvirt.libvirtError as e:
+            log.error("cannot read config of VM %s: %s", VM_NAME, e)
+            return running, None
+        attached = _parse_hostdev_map(xml)
+    log.debug("vm snapshot: running=%r, attached=%r", running, attached)
+    return running, attached
+
+
+def _parse_hostdev_map(xml: str) -> AttachedMap:
+    """{(vid,pid): (bus,device) or None} for USB hostdevs in the live XML.
+
+    NOTE: libvirt's C API virDomainListHostdevs (>= 5.7) has a typed
+    equivalent, but the python bindings do NOT expose it (measured on
+    libvirtd 12.0.0: 'virDomain' object has no attribute 'listHostdevs').
+    XMLDesc(0) + parse is the only binding-visible path, so it stays.
+    """
     found: AttachedMap = {}
-    for block in re.findall(r"<hostdev\b.*?</hostdev>", r.stdout, re.S):
+    for block in re.findall(r"<hostdev\b.*?</hostdev>", xml, re.S):
         mv = re.search(r"<vendor\s+id='(0x[0-9a-fA-F]+)'\s*/>", block)
         mp = re.search(r"<product\s+id='(0x[0-9a-fA-F]+)'\s*/>", block)
         if not (mv and mp):
@@ -207,42 +249,59 @@ def vm_attached_devices() -> AttachedMap | None:
     return found
 
 
+def hostdev_xml(vid: int, pid: int) -> str:
+    # match by vendor/product only — deliberately NO <address>: a host-side
+    # address binds DEVNUM, which changes on every re-enumeration
+    return (
+        "<hostdev mode='subsystem' type='usb' managed='yes'>\n"
+        "  <source>\n"
+        f"    <vendor id='0x{vid:04x}'/>\n"
+        f"    <product id='0x{pid:04x}'/>\n"
+        "  </source>\n"
+        "</hostdev>\n"
+    )
+
+
 def attach_device(vid: int, pid: int) -> bool:
-    """Live-attach; retries internally. Returns True on success."""
+    """Live-attach; retries internally. Returns True on success.
+
+    attachDeviceFlags(xml, VIR_DOMAIN_AFFECT_LIVE) is the exact API that
+    `virsh attach-device --live` drives; the XML string goes in directly
+    (no temp file), and libvirt resolves the host address at attach time.
+    """
     xml = hostdev_xml(vid, pid)
-    path = _xml_tempfile(xml)
-    try:
-        for attempt in range(1, ATTACH_RETRIES + 1):
-            r = _sh(VIRSH + ["attach-device", VM_NAME, path, "--live"])
-            if r is not None and r.returncode == 0:
-                log.info("attached %04x:%04x to %s", vid, pid, VM_NAME)
-                return True
-            log.warning("attach %04x:%04x attempt %d/%d failed: %s",
-                        vid, pid, attempt, ATTACH_RETRIES,
-                        (r.stderr.strip() if r else "virsh unavailable"))
-            if attempt < ATTACH_RETRIES:
-                time.sleep(ATTACH_RETRY_GAP)
-        return False
-    finally:
-        os.unlink(path)
+    for attempt in range(1, ATTACH_RETRIES + 1):
+        with _conn() as conn:
+            if conn is None:
+                reason = "libvirt unavailable"
+            else:
+                try:
+                    conn.lookupByName(VM_NAME).attachDeviceFlags(
+                        xml, libvirt.VIR_DOMAIN_AFFECT_LIVE)
+                    log.info("attached %04x:%04x to %s", vid, pid, VM_NAME)
+                    return True
+                except libvirt.libvirtError as e:
+                    reason = str(e)
+        log.warning("attach %04x:%04x attempt %d/%d failed: %s",
+                    vid, pid, attempt, ATTACH_RETRIES, reason)
+        if attempt < ATTACH_RETRIES:
+            time.sleep(ATTACH_RETRY_GAP)
+    return False
 
 
 def detach_device(vid: int, pid: int) -> bool:
     """Live-detach; tolerant when the device / entry is already gone."""
-    xml = hostdev_xml(vid, pid)
-    path = _xml_tempfile(xml)
-    try:
-        r = _sh(VIRSH + ["detach-device", VM_NAME, path, "--live"])
-    finally:
-        os.unlink(path)
-    if r is None:
-        return False
-    if r.returncode == 0:
-        log.info("detached %04x:%04x from %s", vid, pid, VM_NAME)
-        return True
-    log.info("detach %04x:%04x tolerated: %s", vid, pid,
-             r.stderr.strip() or "rc=%d" % r.returncode)
-    return False
+    with _conn() as conn:
+        if conn is None:
+            return False
+        try:
+            conn.lookupByName(VM_NAME).detachDeviceFlags(
+                hostdev_xml(vid, pid), libvirt.VIR_DOMAIN_AFFECT_LIVE)
+        except libvirt.libvirtError as e:
+            log.info("detach %04x:%04x tolerated: %s", vid, pid, e)
+            return False
+    log.info("detached %04x:%04x from %s", vid, pid, VM_NAME)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -389,25 +448,28 @@ class Daemon:
         if not devpath_present(devpath):
             log.info("%s gone during settle, skipping attach", devpath)
             return
-        running = vm_running()
+        running, attached = vm_snapshot()
         if running is None:
             log.warning("VM state unknown, skipping attach of %s", devpath)
             return
         if not running:
             log.info("VM %s not running, not attaching %s", VM_NAME, devpath)
             return
-        self._heal_attach(rec, devpath)
+        self._heal_attach(rec, devpath, attached=attached)
 
     def _heal_attach(self, rec: DeviceState, devpath: str,
-                     bus: int | None = None, dev: int | None = None) -> None:
+                     bus: int | None = None, dev: int | None = None,
+                     attached: AttachedMap | None = None) -> None:
         """Attach a physically present device, clearing a stale hostdev first.
 
         Shared by the event path (bus/dev unknown: any entry already in the
         VM config counts as stale — the add event itself proves a fresh
         enumeration) and the reconcile path (bus/dev known: stale only when
         the entry's recorded address no longer matches the device).
+        attached is the caller's fresh vm_snapshot() map — None means the
+        config is unreadable, so skip. Reconcile shares its pass-wide read
+        so the config is not re-fetched per device.
         """
-        attached = vm_attached_devices()
         if attached is None:
             log.warning("cannot read VM config, skipping attach of %s", devpath)
             return
@@ -452,9 +514,10 @@ class Daemon:
             # same churn avoidance as above, also when the re-attach failed
             self.clear_timer(TK_ATTACH + devpath)
 
-    def _detach_if_listed(self, vid: int, pid: int) -> None:
-        """Detach a hostdev the VM config still lists (idempotent, tolerant)."""
-        attached = vm_attached_devices()
+    def _detach_if_listed(self, vid: int, pid: int,
+                          attached: AttachedMap | None) -> None:
+        """Detach a hostdev the config still lists (idempotent, tolerant).
+        attached is the caller's vm_snapshot() config map."""
         if attached and (vid, pid) in attached:
             detach_device(vid, pid)
 
@@ -466,9 +529,9 @@ class Daemon:
             if is_allowed(vid, pid):
                 log.info("remove of untracked allowed device %04x:%04x on %s",
                          vid, pid, devpath)
-                running = vm_running()
+                running, attached = vm_snapshot()
                 if running:
-                    self._detach_if_listed(vid, pid)
+                    self._detach_if_listed(vid, pid, attached)
             return
         rec.present = False
         if not is_allowed(rec.vid, rec.pid):
@@ -487,7 +550,7 @@ class Daemon:
         rec = self.devices.get(devpath)
         if not rec:
             return
-        running = vm_running()
+        running, attached = vm_snapshot()
         if running is None:
             log.info("VM state unknown, leaving %s for reconcile", devpath)
             rec.present = False
@@ -497,7 +560,7 @@ class Daemon:
                 detach_device(rec.vid, rec.pid)
                 rec.attached = False
             else:
-                self._detach_if_listed(rec.vid, rec.pid)
+                self._detach_if_listed(rec.vid, rec.pid, attached)
         rec.present = False
 
     # ---- reconciliation -------------------------------------------------
@@ -512,15 +575,16 @@ class Daemon:
         if pyudev is None:
             log.error("pyudev unavailable, reconcile aborted")
             return
-        running = vm_running()
+        running, attached = vm_snapshot()
         if running is None:
             log.warning("cannot determine VM state, reconcile aborted")
             return
-        physical = scan_physical_devices()
-        attached = vm_attached_devices() if running else {}
-        if attached is None:
+        if not running:
+            attached = {}  # config irrelevant while the VM is off
+        elif attached is None:
             log.warning("cannot read VM config, reconcile aborted")
             return
+        physical = scan_physical_devices()
 
         for devpath, (vid, pid, _bus, _dev) in physical.items():
             rec = self.devices.setdefault(devpath, DeviceState(vid, pid))
@@ -544,10 +608,11 @@ class Daemon:
             return
 
         # attach physically-present allowed devices that aren't in the VM
-        # (scan_physical_devices() already filters to the allowlist)
+        # (scan_physical_devices() already filters to the allowlist); the
+        # pass-wide config read is shared, no per-device re-fetch
         for devpath, (vid, pid, bus, dev) in physical.items():
             rec = self.devices[devpath]
-            self._heal_attach(rec, devpath, bus, dev)
+            self._heal_attach(rec, devpath, bus, dev, attached)
 
         # clean zombie entries: allowed hostdev in the VM config whose
         # physical device is not present anywhere
@@ -567,6 +632,11 @@ class Daemon:
         if pyudev is None:
             log.error("python3-pyudev is required; install it "
                       "(e.g. sudo rpm-ostree install python3-pyudev) and "
+                      "restart — exiting")
+            return
+        if libvirt is None:
+            log.error("python3-libvirt is required; install it "
+                      "(e.g. sudo rpm-ostree install python3-libvirt) and "
                       "restart — exiting")
             return
         try:
