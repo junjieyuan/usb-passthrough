@@ -304,7 +304,8 @@ class Daemon:
         except ValueError:
             log.warning("bad PRODUCT %r", product)
             return
-        # skip hubs (USB class 09)
+        # skip hubs (USB class 09, incl. root hub): uevent socket reports
+        # them too, but they're never attach candidates (noise records only)
         try:
             usb_class = int(ev.get("TYPE", "0/0/0").split("/", 1)[0], 16)
         except ValueError:
