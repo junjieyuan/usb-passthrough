@@ -107,7 +107,7 @@
 
 **为什么允许清单按 vid:pid 且不强制 serial**：部分设备**没有** `ID_SERIAL_SHORT`，只能按 vid:pid 匹配；有的设备虽有稳定 serial（且不同状态模式 serial 相同）。所以 serial 只能作为可选的精确化手段，不能是强制条件。
 
-**关于"空闲/未连接"状态**：某些无线接收器设备在"已连接"与"未连接/空壳"两种状态使用不同 PID——已连接状态（真实设备）进允许清单直通；未连接/空壳状态应配入 `USB_PT_IDLE`，记录日志但**永不直通**。直通一个空壳设备毫无意义，还会在客户机里留下一堆死 HID。
+**关于"空闲/未连接"状态**：某些无线接收器设备在"已连接"与"未连接/空壳"两种状态使用不同 PID——只有真实设备状态进允许清单；空壳状态**不配任何清单**，守护进程对它的 add/remove 只做记录与去抖取消（见 §6.3），绝不直通。直通一个空壳设备毫无意义，还会在客户机里留下一堆死 HID（具体设备案例见 AUTHOR_DEPLOYMENT §3）。
 
 **为什么 hub 过滤**：监控会收到 hub（USB class 09，含 root hub）的事件，用 `TYPE` 首字段判类过滤，避免无谓记录。
 
@@ -149,7 +149,7 @@ attach 前查 `dumpxml`（已在配置 → 清失效 → 重挂）；detach 前�
 
 ### 6.6 定时器实现
 
-字符串 key 的 `(due, key, func)` 列表，`set_timer` 同 key 自动去重、`fire_timers` 到期执行且异常隔离。就两种定时器（settle、去抖），用 `heapq` 属于过度设计。
+字符串 key 的 `(due, key, func)` 列表，`set_timer` 同 key 自动去重、`fire_timers` 到期执行且异常隔离。定时器有 settle、去抖、对账三类，统一走同一机制；对账是**自续期周期定时器**（`_reconcile_tick` 每次执行后自行调度下一轮）。用 `heapq` 属于过度设计。
 
 ---
 
@@ -174,7 +174,7 @@ attach 前查 `dumpxml`（已在配置 → 清失效 → 重挂）；detach 前�
 
 **为什么"VM 状态未知时对账直接中止"**：`domstate` 失败 = 无法确认 VM 状态，此时 attach/detach 都可能产生错误副作用，宁可中止等下次。
 
-**手动触发即时对账**：收到 `SIGHUP` 信号后，守护进程在下一个事件循环迭代立即执行一次对账（`sudo systemctl kill -s HUP usb-passthrough`），不需要等 30s 周期——用于部署验证或紧急恢复。
+**手动触发即时对账**：收到 `SIGHUP` 信号后，守护进程用一个零延时、同 key 的对账定时器替换既定计划（`set_timer` 同 key 去重），在下一个事件循环迭代（≤0.5s）内立即执行一次对账（`sudo systemctl kill -s HUP usb-passthrough`），不需要等 30s 周期——用于部署验证或紧急恢复。
 
 **内存卫生**：对账会删除"非白名单且已不在总线上"的设备记录（避免长期运行后记录无限增长）；白名单记录保留，因为可能有未触发的去抖定时器要查它。
 
@@ -233,13 +233,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 ## 10. 真机踩坑记录（通用）
 
-| # | 现象 | 根因 | 修复 | 为什么这样修 |
-|---|---|---|---|---|
-| 1 | 守护进程一直报 "VM not running"，但 VM 明明在跑 | 非英文 locale 下 `virsh domstate` 输出本地化状态名（如 `运行`），与 `"running"` 比较失败 | 所有 virsh 调用强制 `LC_ALL=C` | 状态名/错误信息稳定为英文，且新增状态日志（非 running 时打印实际状态）便于诊断 |
-| 2 | detach 报"打开文件 '-' 失败" | 该 virsh 版本不认 `-` 标准输入，把 `-` 当文件名 open | 改用临时文件传 XML | 兼容所有 virsh 版本，用完即删无残留 |
-| 3 | （代码审查发现）对账先 attach 后，残留 settle 定时器再触发一次 detach+attach 抖动 | 对账与事件路径竞态 | 对账 attach 成功后取消该端口残留的 settle 定时器 | 避免无谓的客户机设备掉线重连 |
-| 4 | （代码审查发现）对账读 VM 配置瞬时失败（dumpxml 出错返回 None）时未防护，`(vid,pid) in attached` 直接 TypeError | `vm_attached_devices()` 返回 None 未检查 | reconcile 增加 `attached is None → 安全中止，下周期重试` | 与"状态未知不动作"同原则：读不到配置宁可中止，绝不基于错误数据动作（其他调用点本就有防护，唯独 reconcile 漏了） |
-| 5 | （代码审查发现）对账失配重挂后，残留 settle 定时器再次触发 detach+attach | 失配分支漏了 `clear_timer`（普通 attach 分支有） | 失配重挂后同步取消该端口 settle 定时器，并置 `rec["attached"]=False` 再按结果更新 | 与对账普通 attach 分支对称，避免无谓抖动；状态字段与实际一致 |
+本仓库踩过的全部真坑（locale 误判、virsh 临时文件、对账竞态×2、dumpxml 失败防护等）与正确做法已合并为**单一权威表**，见 [DEVELOPMENT.md §6](./DEVELOPMENT.md)——这里不再重复维护一份。
 
 ---
 
@@ -247,7 +241,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 **为什么需要自动化验证**：守护进程的行为（去抖、settle、重枚举判断）用真机验证成本高且不可重复，必须用真实数据锁定行为。
 
-1. **回放测试 `test_replay.py`**：把**内嵌在代码里的真实捕获事件**（部署时用 `udevadm monitor` 在真实硬件上采集，**零文件依赖**）按时间戳回放进状态机，mock 掉 virsh 和 sysfs，断言多项行为（attach/detach/不抖动/空闲状态忽略/stale 条目先清再挂/对账地址失配恢复/VM 配置不可读安全中止等）。零副作用、可重复、CI 友好。具体断言清单见 `docs/DEVELOPMENT.md`。
+1. **回放测试 `test_replay.py`**：把**内嵌在代码里的真实捕获事件**（部署时用 `udevadm monitor` 在真实硬件上采集，**零文件依赖**）按时间戳回放进状态机，mock 掉 virsh 和 sysfs，断言多项行为（attach/detach/不抖动/非允许清单设备无动作/stale 条目先清再挂/对账地址失配恢复/VM 配置不可读安全中止等）。零副作用、可重复、CI 友好。具体断言清单见 `docs/DEVELOPMENT.md`。
 2. **集成冒烟**：只读扫描真实 sysfs（容器共享宿主 /sys），验证 `scan_physical_devices()`/`devpath_present()`/事件解析与真实设备数据吻合。
 3. **真机验收**：VM 运行中逐项验证无线切换、开关机、VM 关机释放（本项目作者的真实验收记录见 `docs/AUTHOR_DEPLOYMENT.md`）。
 
@@ -270,14 +264,14 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 | 环境变量 | 默认 | 为什么是这个默认 |
 |---|---|---|
 | `USB_PT_VM` | **无（必填）** | 目标虚拟机名，启动日志会打印确认；缺失拒绝启动 |
-| `USB_PT_ALLOWED` | **无（必填）** | 允许直通清单 `vid:pid,...`，至少一个；缺失拒绝启动 |
-| `USB_PT_IDLE` | 无（可选，默认空） | 永不直通的"空闲/未连接"状态 `vid:pid`，仅记日志 |
-| `USB_PT_SETTLE` | `1.0` | add 后等 1 秒让接口枚举完（见 6.2） |
-| `USB_PT_DEBOUNCE` | `1.0` | remove 后等 1 秒确认不是重枚举（见 6.3） |
+| `USB_PT_ALLOWED` | **无（必填）** | 允许直通清单 `vid:pid,...`，至少一个；缺失拒绝启动。设备的空壳/空闲状态绝不能进此清单 |
+| `USB_PT_SETTLE` | `1` | add 后等 1 秒让接口枚举完（见 6.2） |
+| `USB_PT_DEBOUNCE` | `1` | remove 后等 1 秒确认不是重枚举（见 6.3） |
 | `USB_PT_RECONCILE` | `30` | 对账周期：30 秒内收敛所有异常，兼顾响应与开销 |
 | `USB_PT_ATTACH_RETRIES` | `3` | attach 失败重试 3 次（VM 刚启动 QEMU 未就绪时常见） |
-| `USB_PT_ATTACH_RETRY_GAP` | `1.5` | 重试间隔 1.5 秒 |
+| `USB_PT_ATTACH_RETRY_GAP` | `2` | 重试间隔 2 秒 |
 
+> 数值型配置（SETTLE/DEBOUNCE/RECONCILE/ATTACH_RETRIES/ATTACH_RETRY_GAP）**全部是整数秒/次**；**写错（非整数）会直接拒绝启动**（fast fail：非零退出 + 明确报错），绝不带着错误配置或静默兜底运行；缺失才用默认值。历史上 RETRY_GAP 默认是 1.5（float），整数化后取 2。
 > 作者部署的示例值见 `docs/AUTHOR_DEPLOYMENT.md`。
 
 ---
@@ -290,10 +284,11 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 | 符号 | 作用 |
 |---|---|
+| `VidPid` / `BusDev` / `AttachedMap` | 类型别名：`(vid,pid)` / `(bus,device)` / `vid:pid → 记录地址` 的映射（地址缺失为 `None`） |
 | `VM_NAME` | 目标 VM 名（env `USB_PT_VM`，必填，无内置默认） |
+| `_env_int(name, default)` | 环境变量整数解析（所有数值配置共用）：缺失用默认值；**坏值（非整数）直接拒绝启动（fast fail：非零退出 + 明确报错），绝不兜底** |
 | `_parse_pairs(s)` | 解析 `vid:pid` 逗号列表 → 元组列表；坏项记警告跳过（不崩溃） |
-| `ALLOWED` | 允许直通清单（env `USB_PT_ALLOWED`，必填） |
-| `KNOWN_IDLE` | 永不直通、仅记日志的状态（env `USB_PT_IDLE`，可选，默认空） |
+| `ALLOWED` | 允许直通清单（env `USB_PT_ALLOWED`，必填；空壳/空闲状态不得列入） |
 | `SETTLE_SEC` / `REMOVE_DEBOUNCE_SEC` / `RECONCILE_SEC` / `ATTACH_RETRIES` / `ATTACH_RETRY_GAP` | 时序与重试参数（§13） |
 
 ### 14.2 libvirt 动作层
@@ -319,16 +314,19 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 | 成员 | 职责 |
 |---|---|
-| `self.devices` | `devpath → {vid, pid, present, attached}`（事件/对账共享的状态表） |
-| `self.timers` | `(due, key, func)` 列表；`set_timer` 同 key 去重、`fire_timers` 到期执行且异常隔离 |
-| `self.reconcile_due` | 下次对账的单调时钟时间点 |
+| `DeviceState` | dataclass 记录 `{vid, pid, present, attached}`——每端口设备状态（事件/对账共享），字符串键 dict 的类型安全替代 |
+| `self.devices` | `devpath → DeviceState`（事件/对账共享的状态表） |
+| `self.timers` | `(due, key, func)` 列表；`set_timer` 同 key 去重、`fire_timers` 到期执行且异常隔离；settle/去抖/对账三类统一（对账为自续期周期定时器，§6.6） |
+| `_reconcile_tick` | 一次对账（异常隔离）+ 自续期调度下一轮；也是 SIGHUP 手动触发的入口 |
 | `handle_event(ev)` | 入口：校验 DEVTYPE / 解析 PRODUCT / hub 过滤 → 只分派 `add`/`remove`（§6.1） |
-| `on_add` | 置 present → IDLE/非白名单短路 → 调度 settle 定时器（§6.2） |
-| `attach_if_needed` | settle 到期执行：present + 物理存在 + VM 运行 + 配置可读 → 失效条目先清再挂 → attach |
+| `on_add` | 置 present → 非白名单短路 → 调度 settle 定时器（§6.2） |
+| `attach_if_needed` | settle 到期执行：present + 物理存在 + VM 运行 → 调 `_heal_attach` |
+| `_heal_attach` | 事件/对账共享的「失效判定 → 先清再挂 → 清 settle 定时器」：事件路径（无地址）有残留条目即失效；对账路径按地址比对，记录地址缺失时保守视为健康（§6.4/§7） |
+| `_detach_if_listed` | 「VM 配置里还列着该设备就 detach」的共享助手（未跟踪设备的 remove 即时清理与 `maybe_detach` 兜底共用） |
 | `on_remove` | 未跟踪设备即时清理（查配置）→ 已知设备置 present=False 并调度去抖（§6.3） |
 | `maybe_detach` | 去抖到期执行：端口重现=重枚举跳过；VM 未知留给对账；真拔 → detach |
-| `reconcile` | 三动作：补 attach / 地址比对恢复失效条目 / 清僵尸；附内存卫生（§7） |
-| `run` | pyudev 检查 → monitor 初始化 → **启动即对账** → select 循环（排空事件 / 周期对账 / 定时器） |
+| `reconcile` | 三动作：补 attach（经 `_heal_attach`）/ 清僵尸；附内存卫生（§7） |
+| `run` | pyudev 检查 → monitor 初始化 → **启动即对账**（`_reconcile_tick`）→ select 循环（排空事件 / 定时器） |
 
 ### 14.5 入口 `main`
 
@@ -337,7 +335,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 | `--reconcile-once` | 执行一次对账后退出（部署验证用） |
 | `--debug` | DEBUG 级别日志 |
 | 环境变量校验 | 缺 `USB_PT_VM` / `USB_PT_ALLOWED` 时打印缺失项并以非零码退出（守护循环与 `--reconcile-once` 都覆盖） |
-| `SIGHUP` | 立即触发一次对账（`systemctl kill -s HUP usb-passthrough`） |
+| `SIGHUP` | 以同 key 零延时定时器替换对账计划 → 下一个循环迭代（≤0.5s）内立即对账（`systemctl kill -s HUP usb-passthrough`） |
 
 ---
 
@@ -384,6 +382,6 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 | settle | add 后、attach 前的等待期（等接口枚举完） |
 | 去抖（debounce） | remove 后、detach 前的等待期（区分真拔与重枚举） |
 | reconcile（对账） | 周期性"物理设备清单 vs VM 配置清单"对齐 |
-| IDLE / 空闲状态 | 无线接收器未连接设备时的空壳状态（配入 `USB_PT_IDLE`），永不直通 |
+| IDLE / 空闲状态 | 无线接收器未连接设备时的空壳状态，不在允许清单，守护进程不做任何动作 |
 | `managed='yes'` | libvirt 自动管理宿主驱动解绑/回绑 |
 | 地址比对 | 对账用"XML 记录地址 vs 设备当前 bus/device"判断条目是否失效 |

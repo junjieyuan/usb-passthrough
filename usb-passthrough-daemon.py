@@ -17,15 +17,14 @@ Requires python3-pyudev; the daemon refuses to start without it.
 Design decisions (rationale in docs/DESIGN.md):
     * identity  = PRODUCT=vid/pid/rev (present on both add AND remove events)
                   + DEVPATH (stable port path; DEVNUM changes on every
-                  re-enumeration, e.g. 8BitDo 3106<->3109, Razer 004->053)
+                  re-enumeration)
     * only ACTION=add / ACTION=remove are acted upon
       (insertion fires add/change/bind, removal fires unbind/remove)
     * settle delay before attach (device still enumerating interfaces)
-    * debounce before detach (some wireless devices re-enumerate on
-      sleep/wake or mode switches — e.g. 8BitDo IDLE<->active; a reappearing
-      port means no real removal). The Razer mouse's BT<->2.4G switch emits
-      NO udev events, so a switching mouse never reaches this path.
-    * 8BitDo receivers in "IDLE" mode (2dc8:3109) are deliberately ignored
+    * debounce before detach (wireless devices re-enumerate on sleep/wake
+      or mode switches; a reappearing port means no real removal)
+    * only allowlisted devices are ever acted upon; anything else is
+      ignored
     * never act when the VM state is unknown (e.g. libvirtd down):
       attach/detach decisions are skipped, reconcile retries later
 """
@@ -39,6 +38,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
+from typing import Callable
 
 # pyudev is the ONLY event source (no fallback). Guarded import: tests can
 # load this module without pyudev; the daemon refuses to start without it.
@@ -46,6 +47,20 @@ try:
     import pyudev  # noqa: F401
 except ImportError:
     pyudev = None
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+# (vendor id, product id)
+VidPid = tuple[int, int]
+# host bus/device address libvirt resolved at attach time
+BusDev = tuple[int, int]
+# vid:pid -> address recorded in the VM's live XML (None when the XML entry
+# carries no <address>)
+AttachedMap = dict[VidPid, BusDev | None]
+
+log = logging.getLogger("usb-pt")
 
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via environment)
@@ -56,8 +71,23 @@ except ImportError:
 VM_NAME = os.environ.get("USB_PT_VM")
 
 
-def _parse_pairs(s):
-    out = []
+def _env_int(name: str, default: int) -> int:
+    """Env var as an integer; missing uses the default, malformed aborts
+    startup (deliberately fail-fast: running with a misconfigured value is
+    worse than not running at all, so a bad value refuses to start instead
+    of silently falling back to the default)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        sys.exit(f"error: invalid {name}={raw!r} (not an integer); refusing to "
+                 f"start — fix it or unset it to use the default {default}")
+
+
+def _parse_pairs(s: str) -> list[VidPid]:
+    out: list[VidPid] = []
     for part in s.split(","):
         part = part.strip()
         if not part:
@@ -66,41 +96,32 @@ def _parse_pairs(s):
             v, p = part.split(":", 1)
             out.append((int(v, 16), int(p, 16)))
         except ValueError:
-            logging.getLogger("usb-pt").warning("ignoring bad pair: %r", part)
+            log.warning("ignoring bad pair: %r", part)
     return out
 
 
 # Devices to pass through: comma-separated "vid:pid" hex pairs (required).
 ALLOWED = _parse_pairs(os.environ.get("USB_PT_ALLOWED", ""))
 
-# "Idle" states of the same hardware that must never be attached (log only).
-# Optional: empty by default, no hardcoded devices.
-KNOWN_IDLE = _parse_pairs(os.environ.get("USB_PT_IDLE", ""))
-
-SETTLE_SEC = float(os.environ.get("USB_PT_SETTLE", "1.0"))
-REMOVE_DEBOUNCE_SEC = float(os.environ.get("USB_PT_DEBOUNCE", "1.0"))
-RECONCILE_SEC = float(os.environ.get("USB_PT_RECONCILE", "30"))
-ATTACH_RETRIES = int(os.environ.get("USB_PT_ATTACH_RETRIES", "3"))
-ATTACH_RETRY_GAP = float(os.environ.get("USB_PT_ATTACH_RETRY_GAP", "1.5"))
+SETTLE_SEC = _env_int("USB_PT_SETTLE", 1)
+REMOVE_DEBOUNCE_SEC = _env_int("USB_PT_DEBOUNCE", 1)
+RECONCILE_SEC = _env_int("USB_PT_RECONCILE", 30)
+ATTACH_RETRIES = _env_int("USB_PT_ATTACH_RETRIES", 3)
+ATTACH_RETRY_GAP = _env_int("USB_PT_ATTACH_RETRY_GAP", 2)
 
 VIRSH = ["virsh"]
 
-log = logging.getLogger("usb-pt")
 
-
-def is_allowed(vid, pid):
+def is_allowed(vid: int, pid: int) -> bool:
     return (vid, pid) in ALLOWED
-
-
-def is_idle(vid, pid):
-    return (vid, pid) in KNOWN_IDLE
 
 
 # ---------------------------------------------------------------------------
 # libvirt helpers
 # ---------------------------------------------------------------------------
 
-def _sh(cmd, timeout=15, **kw):
+def _sh(cmd: list[str], timeout: float = 15,
+        **kw: object) -> subprocess.CompletedProcess | None:
     # C locale so virsh state names / error strings are stable English
     kw.setdefault("env", {**os.environ, "LC_ALL": "C"})
     try:
@@ -114,7 +135,7 @@ def _sh(cmd, timeout=15, **kw):
         return None
 
 
-def vm_running():
+def vm_running() -> bool | None:
     """Return True/False, or None when the state cannot be determined.
 
     Callers must never treat None as "not running": on an unknown state we
@@ -129,7 +150,7 @@ def vm_running():
     return state == "running"
 
 
-def _xml_tempfile(xml):
+def _xml_tempfile(xml: str) -> str:
     """Write hostdev XML to a temp file (virsh needs a real path, not '-')."""
     fd, path = tempfile.mkstemp(prefix="usb-pt-", suffix=".xml")
     try:
@@ -141,7 +162,7 @@ def _xml_tempfile(xml):
     return path
 
 
-def hostdev_xml(vid, pid):
+def hostdev_xml(vid: int, pid: int) -> str:
     # match by vendor/product only — deliberately NO <address>: a host-side
     # address binds DEVNUM, which changes on every re-enumeration
     return (
@@ -154,7 +175,7 @@ def hostdev_xml(vid, pid):
     )
 
 
-def vm_attached_devices():
+def vm_attached_devices() -> AttachedMap | None:
     """Return {(vid,pid): (host bus, host device) or None} for USB hostdevs
     in the VM's live config; None on error.
 
@@ -166,7 +187,7 @@ def vm_attached_devices():
     r = _sh(VIRSH + ["dumpxml", VM_NAME])
     if r is None or r.returncode != 0:
         return None
-    found = {}
+    found: AttachedMap = {}
     for block in re.findall(r"<hostdev\b.*?</hostdev>", r.stdout, re.S):
         mv = re.search(r"<vendor\s+id='(0x[0-9a-fA-F]+)'\s*/>", block)
         mp = re.search(r"<product\s+id='(0x[0-9a-fA-F]+)'\s*/>", block)
@@ -186,7 +207,7 @@ def vm_attached_devices():
     return found
 
 
-def attach_device(vid, pid):
+def attach_device(vid: int, pid: int) -> bool:
     """Live-attach; retries internally. Returns True on success."""
     xml = hostdev_xml(vid, pid)
     path = _xml_tempfile(xml)
@@ -206,7 +227,7 @@ def attach_device(vid, pid):
         os.unlink(path)
 
 
-def detach_device(vid, pid):
+def detach_device(vid: int, pid: int) -> bool:
     """Live-detach; tolerant when the device / entry is already gone."""
     xml = hostdev_xml(vid, pid)
     path = _xml_tempfile(xml)
@@ -228,16 +249,16 @@ def detach_device(vid, pid):
 # sysfs helpers
 # ---------------------------------------------------------------------------
 
-def devpath_present(devpath):
+def devpath_present(devpath: str) -> bool:
     return os.path.isdir("/sys" + devpath)
 
 
-def scan_physical_devices():
+def scan_physical_devices() -> dict[str, tuple[int, int, int | None, int | None]]:
     """Return {devpath: (vid, pid, bus, device)} for allowlisted devices on
     the bus now. bus/device are the current host USB numbers (None if
     unreadable); they are compared against the VM entry's recorded address
     to detect stale hostdevs after re-enumeration."""
-    out = {}
+    out: dict[str, tuple[int, int, int | None, int | None]] = {}
     ctx = pyudev.Context()
     for dev in ctx.list_devices(subsystem="usb", DEVTYPE="usb_device"):
         try:
@@ -249,10 +270,10 @@ def scan_physical_devices():
             continue
         try:
             bus = int(dev.attributes.get("busnum").decode())
-            devn = int(dev.attributes.get("devnum").decode())
+            devnum = int(dev.attributes.get("devnum").decode())
         except (AttributeError, ValueError):
-            bus = devn = None
-        out[dev.device_path] = (vid, pid, bus, devn)
+            bus = devnum = None
+        out[dev.device_path] = (vid, pid, bus, devnum)
     return out
 
 
@@ -260,22 +281,36 @@ def scan_physical_devices():
 # daemon
 # ---------------------------------------------------------------------------
 
+@dataclass
+class DeviceState:
+    """Per-port device record shared by the event and reconcile paths."""
+    vid: int
+    pid: int
+    present: bool = False
+    attached: bool = False
+
+
+# timer keys (settle/debounce keys carry the devpath as suffix)
+TK_ATTACH = "attach:"
+TK_DEBOUNCE = "debounce-remove:"
+TK_RECONCILE = "reconcile"
+
+
 class Daemon:
-    def __init__(self):
-        self.devices = {}          # devpath -> record {vid,pid,present,attached}
-        self.timers = []           # (due, key, callable)
-        self.reconcile_due = float("inf")
+    def __init__(self) -> None:
+        self.devices: dict[str, DeviceState] = {}  # devpath -> record
+        self.timers: list[tuple[float, str, Callable[[], None]]] = []
 
     # ---- timers ---------------------------------------------------------
 
-    def set_timer(self, key, delay, func):
+    def set_timer(self, key: str, delay: float, func: Callable[[], None]) -> None:
         self.clear_timer(key)
         self.timers.append((time.monotonic() + delay, key, func))
 
-    def clear_timer(self, key):
+    def clear_timer(self, key: str) -> None:
         self.timers = [t for t in self.timers if t[1] != key]
 
-    def fire_timers(self):
+    def fire_timers(self) -> None:
         now = time.monotonic()
         due = [t for t in self.timers if t[0] <= now]
         self.timers = [t for t in self.timers if t[0] > now]
@@ -285,9 +320,22 @@ class Daemon:
             except Exception:
                 log.exception("timer callback failed")
 
+    def _reconcile_tick(self) -> None:
+        """One reconcile pass, then self-reschedule for the next period.
+
+        Also the SIGHUP path: set_timer(TK_RECONCILE, 0.0, ...) replaces the
+        scheduled pass (same key), so the manual trigger fires immediately
+        and the cycle continues from there.
+        """
+        try:
+            self.reconcile()
+        except Exception:
+            log.exception("reconcile failed")
+        self.set_timer(TK_RECONCILE, RECONCILE_SEC, self._reconcile_tick)
+
     # ---- udev events ----------------------------------------------------
 
-    def handle_event(self, ev):
+    def handle_event(self, ev: dict) -> None:
         if ev.get("DEVTYPE") != "usb_device":
             return
         devpath = ev.get("devpath")
@@ -318,24 +366,25 @@ class Daemon:
             self.on_remove(devpath, vid, pid)
         # change / bind / unbind are deliberately ignored
 
-    def on_add(self, devpath, vid, pid):
-        rec = self.devices.setdefault(devpath, {
-            "vid": vid, "pid": pid, "present": False, "attached": False})
-        rec.update(vid=vid, pid=pid, present=True)
-        self.clear_timer("debounce-remove:" + devpath)
-        if is_idle(vid, pid):
-            log.info("idle-mode device %04x:%04x on %s ignored", vid, pid, devpath)
-            return
+    def on_add(self, devpath: str, vid: int, pid: int) -> None:
+        rec = self.devices.setdefault(devpath, DeviceState(vid, pid))
+        rec.vid = vid
+        rec.pid = pid
+        rec.present = True
+        self.clear_timer(TK_DEBOUNCE + devpath)
         if not is_allowed(vid, pid):
+            # a non-allowlisted device still cancels a pending debounce
+            # above (same port = re-enumeration, not a real removal), but
+            # is otherwise ignored: no settle timer, no attach
             return
         log.info("add %04x:%04x on %s (settle %.1fs)", vid, pid, devpath,
                  SETTLE_SEC)
-        self.set_timer("attach:" + devpath, SETTLE_SEC,
+        self.set_timer(TK_ATTACH + devpath, SETTLE_SEC,
                        lambda: self.attach_if_needed(devpath))
 
-    def attach_if_needed(self, devpath):
+    def attach_if_needed(self, devpath: str) -> None:
         rec = self.devices.get(devpath)
-        if not rec or not rec.get("present"):
+        if not rec or not rec.present:
             return
         if not devpath_present(devpath):
             log.info("%s gone during settle, skipping attach", devpath)
@@ -347,21 +396,69 @@ class Daemon:
         if not running:
             log.info("VM %s not running, not attaching %s", VM_NAME, devpath)
             return
-        vid, pid = rec["vid"], rec["pid"]
+        self._heal_attach(rec, devpath)
+
+    def _heal_attach(self, rec: DeviceState, devpath: str,
+                     bus: int | None = None, dev: int | None = None) -> None:
+        """Attach a physically present device, clearing a stale hostdev first.
+
+        Shared by the event path (bus/dev unknown: any entry already in the
+        VM config counts as stale — the add event itself proves a fresh
+        enumeration) and the reconcile path (bus/dev known: stale only when
+        the entry's recorded address no longer matches the device).
+        """
         attached = vm_attached_devices()
         if attached is None:
             log.warning("cannot read VM config, skipping attach of %s", devpath)
             return
-        if (vid, pid) in attached:
-            # stale hostdev entry from an earlier enumeration: clear it, then
-            # attach fresh (the guest already lost the device on the physical
-            # remove, and the XML entry alone won't bring it back)
-            log.info("stale hostdev %04x:%04x, detaching first", vid, pid)
-            detach_device(vid, pid)
-        if attach_device(vid, pid):
-            rec["attached"] = True
+        key = (rec.vid, rec.pid)
+        if key in attached:
+            xml_addr = attached[key]
+            if bus is None:
+                stale = True
+            elif xml_addr is None:
+                # recorded address absent: conservatively treat as healthy
+                stale = False
+            else:
+                stale = xml_addr != (bus, dev)
+            if not stale:
+                rec.attached = True
+                return
+            if bus is None:
+                log.info("stale hostdev %04x:%04x, detaching first",
+                         rec.vid, rec.pid)
+            else:
+                # the VM entry was resolved at an earlier enumeration and
+                # the guest already lost the device — clear the stale
+                # entry, then attach fresh
+                log.info("reconcile: hostdev %04x:%04x resolved at %s but "
+                         "device now at %s — stale entry, re-attaching",
+                         rec.vid, rec.pid, xml_addr, (bus, dev))
+            detach_device(rec.vid, rec.pid)
+            cleared_stale = True
+        else:
+            if bus is not None:
+                log.info("reconcile: attaching %04x:%04x (%s)",
+                         rec.vid, rec.pid, devpath)
+            cleared_stale = False
+        rec.attached = False
+        if attach_device(rec.vid, rec.pid):
+            rec.attached = True
+            # cancel a settle timer that may still be pending for this
+            # enumeration; it would otherwise re-run attach_if_needed and
+            # cause a needless detach+attach churn
+            self.clear_timer(TK_ATTACH + devpath)
+        elif cleared_stale:
+            # same churn avoidance as above, also when the re-attach failed
+            self.clear_timer(TK_ATTACH + devpath)
 
-    def on_remove(self, devpath, vid, pid):
+    def _detach_if_listed(self, vid: int, pid: int) -> None:
+        """Detach a hostdev the VM config still lists (idempotent, tolerant)."""
+        attached = vm_attached_devices()
+        if attached and (vid, pid) in attached:
+            detach_device(vid, pid)
+
+    def on_remove(self, devpath: str, vid: int, pid: int) -> None:
         rec = self.devices.get(devpath)
         if rec is None:
             # daemon may have started mid-life; heal immediately if the VM
@@ -371,19 +468,17 @@ class Daemon:
                          vid, pid, devpath)
                 running = vm_running()
                 if running:
-                    attached = vm_attached_devices()
-                    if attached and (vid, pid) in attached:
-                        detach_device(vid, pid)
+                    self._detach_if_listed(vid, pid)
             return
-        rec["present"] = False
-        if not is_allowed(rec["vid"], rec["pid"]):
+        rec.present = False
+        if not is_allowed(rec.vid, rec.pid):
             return
         log.info("remove %04x:%04x on %s (debounce %.1fs)",
-                 rec["vid"], rec["pid"], devpath, REMOVE_DEBOUNCE_SEC)
-        self.set_timer("debounce-remove:" + devpath, REMOVE_DEBOUNCE_SEC,
+                 rec.vid, rec.pid, devpath, REMOVE_DEBOUNCE_SEC)
+        self.set_timer(TK_DEBOUNCE + devpath, REMOVE_DEBOUNCE_SEC,
                        lambda: self.maybe_detach(devpath))
 
-    def maybe_detach(self, devpath):
+    def maybe_detach(self, devpath: str) -> None:
         if devpath_present(devpath):
             # same port re-enumerated (BT<->2.4G switch, sleep/wake, flap):
             # no real removal, keep whatever state we have
@@ -395,21 +490,19 @@ class Daemon:
         running = vm_running()
         if running is None:
             log.info("VM state unknown, leaving %s for reconcile", devpath)
-            rec["present"] = False
+            rec.present = False
             return
         if running:
-            if rec.get("attached"):
-                detach_device(rec["vid"], rec["pid"])
-                rec["attached"] = False
+            if rec.attached:
+                detach_device(rec.vid, rec.pid)
+                rec.attached = False
             else:
-                attached = vm_attached_devices()
-                if attached and (rec["vid"], rec["pid"]) in attached:
-                    detach_device(rec["vid"], rec["pid"])
-        rec["present"] = False
+                self._detach_if_listed(rec.vid, rec.pid)
+        rec.present = False
 
     # ---- reconciliation -------------------------------------------------
 
-    def reconcile(self):
+    def reconcile(self) -> None:
         """Diff physical devices vs VM config; heal attach/detach state.
 
         Covers: devices already present when the VM started, service
@@ -430,57 +523,31 @@ class Daemon:
             return
 
         for devpath, (vid, pid, _bus, _dev) in physical.items():
-            rec = self.devices.setdefault(devpath, {
-                "vid": vid, "pid": pid, "present": False, "attached": False})
-            rec.update(vid=vid, pid=pid, present=True)
-            self.clear_timer("debounce-remove:" + devpath)
+            rec = self.devices.setdefault(devpath, DeviceState(vid, pid))
+            rec.vid = vid
+            rec.pid = pid
+            rec.present = True
+            self.clear_timer(TK_DEBOUNCE + devpath)
         for devpath, rec in list(self.devices.items()):
             if devpath not in physical:
-                rec["present"] = False
+                rec.present = False
                 # drop records for non-allowlisted devices (they never hold
                 # timers or attach state); allowlisted records are kept so a
                 # pending debounce timer can still find them
-                if not is_allowed(rec["vid"], rec["pid"]):
+                if not is_allowed(rec.vid, rec.pid):
                     del self.devices[devpath]
 
         if not running:
             for rec in self.devices.values():
-                rec["attached"] = False
+                rec.attached = False
             log.info("VM not running, nothing to do")
             return
 
         # attach physically-present allowed devices that aren't in the VM
+        # (scan_physical_devices() already filters to the allowlist)
         for devpath, (vid, pid, bus, dev) in physical.items():
-            if is_idle(vid, pid):
-                continue
             rec = self.devices[devpath]
-            if (vid, pid) in attached:
-                rec["attached"] = True
-                xml_addr = attached[(vid, pid)]
-                if (xml_addr is not None and bus is not None
-                        and xml_addr != (bus, dev)):
-                    # the VM entry was resolved at an earlier enumeration and
-                    # the guest already lost the device — clear the stale
-                    # entry, then attach fresh (covers daemon late start and
-                    # events missed during daemon downtime)
-                    log.info("reconcile: hostdev %04x:%04x resolved at %s but "
-                             "device now at %s — stale entry, re-attaching",
-                             vid, pid, xml_addr, (bus, dev))
-                    detach_device(vid, pid)
-                    rec["attached"] = False
-                    if attach_device(vid, pid):
-                        rec["attached"] = True
-                    # a settle timer may still be pending for this
-                    # enumeration; it would otherwise re-run attach_if_needed
-                    # and cause a needless detach+attach churn
-                    self.clear_timer("attach:" + devpath)
-                continue
-            log.info("reconcile: attaching %04x:%04x (%s)", vid, pid, devpath)
-            if attach_device(vid, pid):
-                rec["attached"] = True
-                # cancel a still-pending settle timer for this enumeration
-                # (same churn avoidance as the stale-address branch above)
-                self.clear_timer("attach:" + devpath)
+            self._heal_attach(rec, devpath, bus, dev)
 
         # clean zombie entries: allowed hostdev in the VM config whose
         # physical device is not present anywhere
@@ -494,7 +561,7 @@ class Daemon:
 
     # ---- main loop ------------------------------------------------------
 
-    def run(self):
+    def run(self) -> None:
         log.info("starting USB passthrough daemon (VM=%s, allowed=%s)",
                  VM_NAME, ", ".join("%04x:%04x" % p for p in ALLOWED))
         if pyudev is None:
@@ -509,13 +576,14 @@ class Daemon:
             log.error("pyudev monitor init failed: %s", e)
             return
         log.info("event source: pyudev (libudev, kernel uevent socket)")
-        self.reconcile()
-        self.reconcile_due = time.monotonic() + RECONCILE_SEC
+        # startup reconcile (immediately, as before) + schedule the periodic
+        # pass; _reconcile_tick self-reschedules from then on
+        self._reconcile_tick()
         fd = monitor.fileno()
         while True:
             try:
-                # 0.5s timeout wakes the loop for timers / reconcile even
-                # when no uevent arrives
+                # 0.5s timeout wakes the loop for timers even when no
+                # uevent arrives
                 ready, _, _ = select.select([fd], [], [], 0.5)
             except (OSError, ValueError):
                 break
@@ -539,22 +607,14 @@ class Daemon:
                         })
                     except Exception:
                         log.exception("event handling failed")
-            now = time.monotonic()
-            if now >= self.reconcile_due:
-                try:
-                    self.reconcile()
-                except Exception:
-                    log.exception("reconcile failed")
-                self.reconcile_due = now + RECONCILE_SEC
             self.fire_timers()
 
 
-def main():
+def main() -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if "--debug" in sys.argv:
         logging.getLogger().setLevel(logging.DEBUG)
-    daemon = Daemon()
     missing = []
     if not VM_NAME:
         missing.append("USB_PT_VM")
@@ -566,12 +626,16 @@ def main():
                   "(set them in the systemd unit's Environment= or the shell)",
                   ", ".join(missing))
         return 1
+    daemon = Daemon()
     if "--reconcile-once" in sys.argv:
         daemon.reconcile()
         return 0
-    # SIGHUP: pull the reconcile deadline to now -> immediate reconcile
+    # SIGHUP: push a zero-delay reconcile timer — set_timer's same-key
+    # dedupe makes it replace the scheduled pass, so the reconcile runs on
+    # the next loop iteration and the cycle continues from there
     signal.signal(signal.SIGHUP,
-                  lambda s, f: setattr(daemon, "reconcile_due", time.monotonic()))
+                  lambda s, f: daemon.set_timer(TK_RECONCILE, 0.0,
+                                                daemon._reconcile_tick))
     try:
         daemon.run()
     except KeyboardInterrupt:

@@ -74,15 +74,14 @@ sudo dnf install python3-pyudev          # Arch: sudo pacman -S python-pyudev
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `USB_PT_VM` | **无（必填）** | 目标虚拟机名 |
-| `USB_PT_ALLOWED` | **无（必填）** | 允许直通的设备 `vid:pid,...`（至少一个） |
-| `USB_PT_IDLE` | 无（可选，默认空） | 永不直通的"空闲状态" `vid:pid`（如某些无线接收器未连接时的空壳 HID），仅记日志 |
-| `USB_PT_SETTLE` | `1.0` | add 后等待秒数 |
-| `USB_PT_DEBOUNCE` | `1.0` | remove 后去抖秒数 |
+| `USB_PT_ALLOWED` | **无（必填）** | 允许直通的设备 `vid:pid,...`（至少一个）；设备的空壳/空闲状态（如某些无线接收器未连接时）绝不能进此清单 |
+| `USB_PT_SETTLE` | `1` | add 后等待秒数（整数） |
+| `USB_PT_DEBOUNCE` | `1` | remove 后去抖秒数（整数） |
 | `USB_PT_RECONCILE` | `30` | 对账周期秒数 |
 | `USB_PT_ATTACH_RETRIES` | `3` | attach 失败重试次数 |
-| `USB_PT_ATTACH_RETRY_GAP` | `1.5` | 重试间隔秒数 |
+| `USB_PT_ATTACH_RETRY_GAP` | `2` | 重试间隔秒数 |
 
-> `USB_PT_VM` 与 `USB_PT_ALLOWED` 必须显式设置，缺失时守护进程拒绝启动并打印缺失项。作者部署的示例值见 `docs/AUTHOR_DEPLOYMENT.md`。
+> `USB_PT_VM` 与 `USB_PT_ALLOWED` 必须显式设置，缺失时守护进程拒绝启动并打印缺失项。数值型配置（SETTLE/DEBOUNCE/RECONCILE/ATTACH_RETRIES/ATTACH_RETRY_GAP）**只接受整数**，写错（如 `1.0`、`abc`）会直接拒绝启动（不兜底），未设置才使用默认值。作者部署的示例值见 `docs/AUTHOR_DEPLOYMENT.md`。
 
 ## 与 virt-manager 配合（推荐用法）
 
@@ -123,7 +122,6 @@ sudo /usr/local/sbin/usb-passthrough-daemon.py --reconcile-once --debug
 | `attached <vid:pid> to <vm>` | 直通成功 |
 | `remove ... (debounce 1.0s)` → `detached ...` | 真拔除，已取消直通 |
 | `... re-enumerated, skipping detach` | 去抖判定为重枚举（模式切换/休眠唤醒），不取消 |
-| `idle-mode device <vid:pid> ... ignored` | 空闲状态设备，永不直通 |
 | `reconcile: hostdev <vid:pid> resolved at (5, 47) but device now at (5, 48) — stale entry, re-attaching` | 对账发现失效条目，先清再挂 |
 | `attach ... failed:` | attach 失败（自动重试 3 次，仍失败交给下次对账） |
 | `python3-pyudev is required` | 缺依赖，装 pyudev 后重启服务 |

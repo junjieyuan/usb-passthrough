@@ -10,12 +10,15 @@ ExecStart=/usr/local/sbin/usb-passthrough-daemon.py
 # REQUIRED — uncomment and set; example values shown are the author's.
 # Environment=USB_PT_VM=windows
 # Environment=USB_PT_ALLOWED=05ac:024f,1532:0083,2dc8:3106
-# Optional — idle/empty states of wireless receivers (no default; example shown):
-# Environment=USB_PT_IDLE=2dc8:3109
-# Optional tuning (defaults shown):
-# Environment=USB_PT_SETTLE=1.0
-# Environment=USB_PT_DEBOUNCE=1.0
+# Note: "idle"/empty receiver states (dongle present, device off) stay
+# deliberately unconfigured — never add them to USB_PT_ALLOWED.
+# Optional tuning (defaults shown; values are integer seconds/counts —
+# decimal values like 1.0 are rejected at startup):
+# Environment=USB_PT_SETTLE=1
+# Environment=USB_PT_DEBOUNCE=1
 # Environment=USB_PT_RECONCILE=30
+# Environment=USB_PT_ATTACH_RETRIES=3
+# Environment=USB_PT_ATTACH_RETRY_GAP=2
 Restart=always
 RestartSec=3
 
