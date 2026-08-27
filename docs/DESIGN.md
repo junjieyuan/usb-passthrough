@@ -244,7 +244,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 **为什么需要自动化验证**：守护进程的行为（去抖、settle、重枚举判断）用真机验证成本高且不可重复，必须用真实数据锁定行为。
 
-1. **回放测试 `test_replay.py`**：把真实捕获的 udev 事件（`sample-events.log`，含 Keychron/Razer/8BitDo 全部模式切换）按时间戳回放进状态机，mock 掉 virsh 和 sysfs，断言 7 项行为（attach/detach/不抖动/IDLE 忽略等）。零副作用、可重复、CI 友好。
+1. **回放测试 `test_replay.py`**：把**内嵌在代码里的 33 个真实捕获事件**（部署时用 `udevadm monitor` 在真实硬件上采集，含 Keychron/Razer/8BitDo 全部模式切换，**零文件依赖**）按时间戳回放进状态机，mock 掉 virsh 和 sysfs，断言 7 项行为（attach/detach/不抖动/IDLE 忽略等）。零副作用、可重复、CI 友好。
 2. **集成冒烟**：只读扫描真实 sysfs（容器共享宿主 /sys），验证 `scan_physical_devices()`/`devpath_present()`/事件解析与真实设备数据吻合。
 3. **真机验收**：VM 运行中逐项验证 K6 蓝牙切换、8BitDo 开关机、VM 关机释放。
 

@@ -16,9 +16,7 @@
 |---|---|
 | `usb-passthrough-daemon.py` | 主程序（Python 3 标准库；依赖 `python3-pyudev`，唯一事件源） |
 | `usb-passthrough.service` | systemd 单元 |
-| `test_replay.py` | 回放事件日志验证状态机（不操作真实设备/VM） |
-| `udev.log` | 原始 udev 事件捕获（部署时的真实日志，`sample-events.log` 的数据来源，入库存档） |
-| `sample-events.log` | 测试夹具 = `udev.log` + Razer 鼠标事件（含 8BitDo IDLE/active 切换） |
+| `test_replay.py` | 回放验证状态机（**零文件依赖**：33 个真实捕获事件内嵌在代码里；不操作真实设备/VM） |
 | `docs/DESIGN.md` | **详尽设计文档与决策记录**（每条设计决策的 why，即代码的"why 注释"载体） |
 
 ## 安装
@@ -92,9 +90,8 @@ VM 名不是 `windows` 的话，编辑 `/etc/systemd/system/usb-passthrough.serv
 ## 测试
 
 ```bash
-# 回放真实事件日志，验证状态机行为（不碰真实设备/VM）
-python3 test_replay.py                 # 默认用 sample-events.log
-python3 test_replay.py ../udev.log     # 或指定任意捕获日志
+# 回放内置的真实捕获事件，验证状态机行为（零文件依赖、不碰真实设备/VM）
+python3 test_replay.py
 
 # 单次对账（安全，可随时跑）
 sudo /usr/local/sbin/usb-passthrough-daemon.py --reconcile-once --debug

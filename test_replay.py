@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Replay a captured udev log through the passthrough state machine.
+"""Replay captured USB hotplug events through the passthrough state machine.
+
+Self-contained: the 33 events below were captured with
+`udevadm monitor --property --udev --subsystem-match=usb/usb_device` on the
+real hardware (Keychron K6 keyboard, Razer Basilisk X mouse, 8BitDo Ultimate
+gamepad) and embedded here, so the test needs no external files.
 
 Uses mocked virsh/sysfs, so nothing real is touched. Validates:
   * allowed devices get attached on add (settle)
@@ -9,17 +14,14 @@ Uses mocked virsh/sysfs, so nothing real is touched. Validates:
   * 8BitDo IDLE mode (2dc8:3109) is never attached
 
 Note: the Razer mouse's BT<->2.4G switch emits NO udev events (the dongle
-stays enumerated), so the 7202/7229 remove+add in the fixture is a real
+stays enumerated), so the 7202/7229 remove+add below is a real
 removal/insertion (unplug or power cycle), not a mode switch.
 
-Usage: python3 test_replay.py /path/to/udev.log
+Usage: python3 test_replay.py
 """
 
 import importlib.util
-import re
 import sys
-
-LOG_PATH = sys.argv[1] if len(sys.argv) > 1 else "sample-events.log"
 
 spec = importlib.util.spec_from_file_location(
     "usb_pt", "usb-passthrough-daemon.py")
@@ -57,36 +59,45 @@ def fake_present(devpath):
 
 d.devpath_present = fake_present
 
-# --- parse udev.log into (ts, action, devpath, PRODUCT) -------------------
+# --- embedded real events ------------------------------------------------
+# (timestamp, action, devpath, PRODUCT=vid/pid/rev)
+# key 5-2.1.2 = Razer mouse, 5-2.1.3 = 8BitDo gamepad, 5-2.1.4 = K6 keyboard
 
-first_re = re.compile(
-    r"^UDEV\s+\[([0-9.]+)\]\s+(\S+)\s+(\S+)\s+\((\S+)\)")
-events = []
-current = None
-with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
-    for raw in f:
-        line = raw.rstrip("\n").rstrip("\r")
-        if line == "":
-            if current is not None:
-                product = current.get("PRODUCT")
-                if product:
-                    events.append((float(current["_ts"]), current["_action"],
-                                   current["DEVPATH"], product))
-                current = None
-            continue
-        m = first_re.match(line)
-        if m:
-            current = {"_ts": m.group(1), "_action": m.group(2),
-                       "DEVPATH": m.group(3)}
-            continue
-        if current is not None and "=" in line:
-            k, v = line.split("=", 1)
-            current[k] = v
-
-events.sort(key=lambda e: e[0])
-print(f"parsed {len(events)} usb_device events from {LOG_PATH}")
-if not events:
-    sys.exit("no events found")
+EVENTS = [
+    (5782.240824, "add", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.4", "5ac/24f/108"),
+    (5782.243166, "change", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.4", "5ac/24f/108"),
+    (5782.309818, "bind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.4", "5ac/24f/108"),
+    (5788.579430, "unbind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.4", "5ac/24f/108"),
+    (5788.581494, "remove", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.4", "5ac/24f/108"),
+    (5808.300588, "add", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.4", "5ac/24f/108"),
+    (5808.303268, "change", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.4", "5ac/24f/108"),
+    (5808.362577, "bind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.4", "5ac/24f/108"),
+    (6055.202740, "unbind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6055.203968, "remove", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6055.694356, "add", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6055.715780, "bind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6085.409720, "unbind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6085.410932, "remove", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6085.829776, "add", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6085.881377, "bind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6097.441480, "unbind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6097.442829, "remove", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6098.349731, "add", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6098.370519, "bind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6129.185493, "unbind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6129.186760, "remove", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6129.829191, "add", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6129.875350, "bind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6139.425302, "unbind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6139.426567, "remove", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3106/114"),
+    (6140.333062, "add", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (6140.353342, "bind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3", "2dc8/3109/200"),
+    (7202.588124, "unbind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.2", "1532/83/200"),
+    (7202.589344, "remove", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.2", "1532/83/200"),
+    (7229.999828, "add", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.2", "1532/83/200"),
+    (7230.002811, "change", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.2", "1532/83/200"),
+    (7230.106220, "bind", "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.2", "1532/83/200"),
+]
 
 # --- replay ---------------------------------------------------------------
 
@@ -107,7 +118,7 @@ for devpath, (vid, pid) in SEED.items():
                                "present": True, "attached": True}
     fake_sysfs[devpath] = True
 
-for ts, action, devpath, product in events:
+for ts, action, devpath, product in EVENTS:
     fake.t = ts
     daemon.fire_timers()  # pending timers first, with port state as of now
     if action == "add":
@@ -119,7 +130,7 @@ for ts, action, devpath, product in events:
     daemon.handle_event({"action": action, "DEVTYPE": "usb_device",
                          "devpath": devpath, "PRODUCT": product})
 
-fake.t = events[-1][0] + 5.0  # flush remaining timers
+fake.t = EVENTS[-1][0] + 5.0  # flush remaining timers
 daemon.fire_timers()
 
 # --- assertions -----------------------------------------------------------
@@ -153,6 +164,7 @@ checks = [
 ]
 
 failed = False
+print(f"replayed {len(EVENTS)} embedded events (no files needed)")
 for name, ok, why in checks:
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {why}")
     failed = failed or not ok
