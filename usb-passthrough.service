@@ -1,5 +1,5 @@
 [Unit]
-Description=USB input passthrough daemon (hot-plug devices into Windows VM)
+Description=USB input passthrough daemon (hot-plug devices into a VM)
 Documentation=file:/usr/local/sbin/usb-passthrough-daemon.py
 After=libvirtd.service
 Wants=libvirtd.service
@@ -7,8 +7,11 @@ Wants=libvirtd.service
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/usb-passthrough-daemon.py
-# If your Windows VM has a different name, uncomment and adjust:
+# REQUIRED — uncomment and set; example values shown are the author's.
 # Environment=USB_PT_VM=windows
+# Environment=USB_PT_ALLOWED=05ac:024f,1532:0083,2dc8:3106
+# Optional — idle/empty states of wireless receivers (no default; example shown):
+# Environment=USB_PT_IDLE=2dc8:3109
 # Optional tuning (defaults shown):
 # Environment=USB_PT_SETTLE=1.0
 # Environment=USB_PT_DEBOUNCE=1.0
