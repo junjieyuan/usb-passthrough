@@ -17,6 +17,7 @@
 | `usb-passthrough-daemon.py` | 主程序（Python 3 标准库；依赖 `python3-pyudev`，唯一事件源） |
 | `usb-passthrough.service` | systemd 单元 |
 | `test_replay.py` | 回放事件日志验证状态机（不操作真实设备/VM） |
+| `udev.log` | 原始 udev 事件捕获（部署时的真实日志，`sample-events.log` 的数据来源，入库存档） |
 | `sample-events.log` | 测试夹具 = `udev.log` + Razer 鼠标事件（含 8BitDo IDLE/active 切换） |
 | `docs/DESIGN.md` | **详尽设计文档与决策记录**（每条设计决策的 why，即代码的"why 注释"载体） |
 
