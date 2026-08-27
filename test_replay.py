@@ -200,6 +200,47 @@ try:
 finally:
     d.vm_attached_devices, d.attach_device, d.detach_device = saved_mocks
 
+# --- reconcile stale-address recovery check -------------------------------
+# The VM's live config records the host bus/device libvirt resolved at attach
+# time. If the device re-enumerated since (DEVNUM changed), that recorded
+# address no longer matches the physical device — reconcile must detach the
+# stale entry and attach fresh. This covers daemon late start and events
+# missed while the daemon was down (the event path normally handles it via
+# add). A matching address must NOT cause churn.
+REC_DP = "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3"
+saved_rec = (d.pyudev, d.vm_running, d.vm_attached_devices,
+             d.scan_physical_devices, d.attach_device, d.detach_device)
+try:
+    d.pyudev = object()  # satisfy reconcile()'s pyudev-required guard
+    d.vm_running = lambda: True
+    d.vm_attached_devices = lambda: {(0x2DC8, 0x3106): (5, 47)}  # resolved at old enumeration
+    d.scan_physical_devices = lambda: {REC_DP: (0x2DC8, 0x3106, 5, 48)}  # re-enumerated
+    rec_detached = []
+    rec_attached = []
+    d.detach_device = lambda vid, pid: rec_detached.append((vid, pid)) or True
+    d.attach_device = lambda vid, pid: rec_attached.append((vid, pid)) or True
+
+    r = d.Daemon()
+    r.reconcile()
+    ok = (rec_detached == [(0x2DC8, 0x3106)] and
+          rec_attached == [(0x2DC8, 0x3106)])
+    print(f"{'PASS' if ok else 'FAIL'}  reconcile stale-address: detach-then-attach "
+          f"on mismatch (detached={rec_detached}, attached={rec_attached})")
+    failed = failed or not ok
+
+    # healthy case: recorded address matches the current device -> no churn
+    d.vm_attached_devices = lambda: {(0x2DC8, 0x3106): (5, 48)}
+    rec_detached.clear()
+    rec_attached.clear()
+    r2 = d.Daemon()
+    r2.reconcile()
+    ok = not rec_detached and not rec_attached
+    print(f"{'PASS' if ok else 'FAIL'}  reconcile matching address: no detach/attach churn")
+    failed = failed or not ok
+finally:
+    (d.pyudev, d.vm_running, d.vm_attached_devices, d.scan_physical_devices,
+     d.attach_device, d.detach_device) = saved_rec
+
 print("attached:", [f"{v:04x}:{p:04x}" for v, p in attached_log])
 print("detached:", [f"{v:04x}:{p:04x}" for v, p in detached_log])
 sys.exit(1 if failed else 0)

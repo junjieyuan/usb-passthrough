@@ -152,16 +152,34 @@ def hostdev_xml(vid, pid):
 
 
 def vm_attached_devices():
-    """Set of (vid,pid) USB hostdevs in the VM's live config; None on error."""
+    """Return {(vid,pid): (host bus, host device) or None} for USB hostdevs
+    in the VM's live config; None on error.
+
+    The address is libvirt's resolution of the device at attach time.
+    Comparing it with the device's current bus/device numbers reveals
+    re-enumerations: the VM entry is stale and the guest already lost
+    the device.
+    """
     r = _sh(VIRSH + ["dumpxml", VM_NAME])
     if r is None or r.returncode != 0:
         return None
-    found = set()
+    found = {}
     for block in re.findall(r"<hostdev\b.*?</hostdev>", r.stdout, re.S):
         mv = re.search(r"<vendor\s+id='(0x[0-9a-fA-F]+)'\s*/>", block)
         mp = re.search(r"<product\s+id='(0x[0-9a-fA-F]+)'\s*/>", block)
-        if mv and mp:
-            found.add((int(mv.group(1), 16), int(mp.group(1), 16)))
+        if not (mv and mp):
+            continue
+        key = (int(mv.group(1), 16), int(mp.group(1), 16))
+        addr = None
+        ms = re.search(r"<source>.*?</source>", block, re.S)
+        if ms:
+            tag = re.search(r"<address\b[^>]*/>", ms.group(0))
+            if tag:
+                mb = re.search(r"\bbus='(\d+)'", tag.group(0))
+                md = re.search(r"\bdevice='(\d+)'", tag.group(0))
+                if mb and md:
+                    addr = (int(mb.group(1)), int(md.group(1)))
+        found[key] = addr
     return found
 
 
@@ -213,7 +231,10 @@ def devpath_present(devpath):
 
 
 def scan_physical_devices():
-    """Return {devpath: (vid,pid)} for allowlisted devices on the bus now."""
+    """Return {devpath: (vid, pid, bus, device)} for allowlisted devices on
+    the bus now. bus/device are the current host USB numbers (None if
+    unreadable); they are compared against the VM entry's recorded address
+    to detect stale hostdevs after re-enumeration."""
     out = {}
     ctx = pyudev.Context()
     for dev in ctx.list_devices(subsystem="usb", DEVTYPE="usb_device"):
@@ -224,7 +245,12 @@ def scan_physical_devices():
             continue
         if not is_allowed(vid, pid):
             continue
-        out[dev.device_path] = (vid, pid)
+        try:
+            bus = int(dev.attributes.get("busnum").decode())
+            devn = int(dev.attributes.get("devnum").decode())
+        except (AttributeError, ValueError):
+            bus = devn = None
+        out[dev.device_path] = (vid, pid, bus, devn)
     return out
 
 
@@ -395,9 +421,9 @@ class Daemon:
             log.warning("cannot determine VM state, reconcile aborted")
             return
         physical = scan_physical_devices()
-        attached = vm_attached_devices() if running else set()
+        attached = vm_attached_devices() if running else {}
 
-        for devpath, (vid, pid) in physical.items():
+        for devpath, (vid, pid, _bus, _dev) in physical.items():
             rec = self.devices.setdefault(devpath, {
                 "vid": vid, "pid": pid, "present": False, "attached": False})
             rec.update(vid=vid, pid=pid, present=True)
@@ -418,12 +444,25 @@ class Daemon:
             return
 
         # attach physically-present allowed devices that aren't in the VM
-        for devpath, (vid, pid) in physical.items():
+        for devpath, (vid, pid, bus, dev) in physical.items():
             if is_idle(vid, pid):
                 continue
             rec = self.devices[devpath]
             if (vid, pid) in attached:
                 rec["attached"] = True
+                xml_addr = attached[(vid, pid)]
+                if (xml_addr is not None and bus is not None
+                        and xml_addr != (bus, dev)):
+                    # the VM entry was resolved at an earlier enumeration and
+                    # the guest already lost the device — clear the stale
+                    # entry, then attach fresh (covers daemon late start and
+                    # events missed during daemon downtime)
+                    log.info("reconcile: hostdev %04x:%04x resolved at %s but "
+                             "device now at %s — stale entry, re-attaching",
+                             vid, pid, xml_addr, (bus, dev))
+                    detach_device(vid, pid)
+                    if attach_device(vid, pid):
+                        rec["attached"] = True
                 continue
             log.info("reconcile: attaching %04x:%04x (%s)", vid, pid, devpath)
             if attach_device(vid, pid):
@@ -435,7 +474,7 @@ class Daemon:
 
         # clean zombie entries: allowed hostdev in the VM config whose
         # physical device is not present anywhere
-        present_ids = set(physical.values())
+        present_ids = {(vid, pid) for (vid, pid, _b, _d) in physical.values()}
         for (vid, pid) in attached:
             if is_allowed(vid, pid) and (vid, pid) not in present_ids:
                 log.info("reconcile: stale hostdev %04x:%04x, detaching",

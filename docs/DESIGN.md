@@ -157,11 +157,14 @@ attach 前查 `dumpxml`（已在配置 → 清失效 → 重挂）；detach 前�
 
 ## 7. 对账（reconcile）
 
-**做什么**：每 30 秒 + 启动时，把 `scan_physical_devices()`（当前物理允许设备）与 `vm_attached_devices()`（VM live XML 里的 hostdev）求差集：
+**做什么**：每 30 秒 + 启动时，把 `scan_physical_devices()`（当前物理允许设备，含 bus/device）与 `vm_attached_devices()`（VM live XML 里的 hostdev，含 libvirt 记录解析地址）求差集：
 
 - 物理在、VM 没有 → attach；
 - VM 有、物理不在（且允许清单内）→ detach（清僵尸条目）；
+- **物理在、VM 也有，但条目记录地址 ≠ 设备当前 bus/device** → 判定重枚举过、条目失效 → **先 detach 再 attach**（见下）；
 - VM 未运行 → 全部标记未直通、不做任何事（libvirt 在 VM 停止时已自动释放 hostdev）。
+
+**地址比对（stale 条目恢复）**：libvirt 在 attach 时会把解析到的宿主 bus/device 写进 live XML 的 `<source>`（如 `<address bus='5' device='47'/>`）。设备重枚举后 DEVNUM 变化，条目记录地址就陈旧了。对账发现"XML 记录地址 ≠ 物理设备当前地址"即判定失效（guest 早已丢了它），执行 detach + attach 恢复。这补上了"守护进程晚启动 / 守护进程停机期间事件丢失"时事件路径够不到的盲区——设备在位却一直没进 VM 的场景，现在对账也能自愈。地址缺失（`None`）时保守跳过（视为健康），避免误判。
 
 **为什么必须有对账**（事件驱动必然漏事件的三类场景）：
 
@@ -244,7 +247,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 **为什么需要自动化验证**：守护进程的行为（去抖、settle、重枚举判断）用真机验证成本高且不可重复，必须用真实数据锁定行为。
 
-1. **回放测试 `test_replay.py`**：把**内嵌在代码里的 33 个真实捕获事件**（部署时用 `udevadm monitor` 在真实硬件上采集，含 Keychron/Razer/8BitDo 全部模式切换，**零文件依赖**）按时间戳回放进状态机，mock 掉 virsh 和 sysfs，断言 8 项行为（attach/detach/不抖动/IDLE 忽略/**stale 条目先清再挂**等）。零副作用、可重复、CI 友好。
+1. **回放测试 `test_replay.py`**：把**内嵌在代码里的 33 个真实捕获事件**（部署时用 `udevadm monitor` 在真实硬件上采集，含 Keychron/Razer/8BitDo 全部模式切换，**零文件依赖**）按时间戳回放进状态机，mock 掉 virsh 和 sysfs，断言 10 项行为（attach/detach/不抖动/IDLE 忽略/stale 条目先清再挂/对账地址失配恢复等）。零副作用、可重复、CI 友好。
 2. **集成冒烟**：只读扫描真实 sysfs（容器共享宿主 /sys），验证 `scan_physical_devices()`/`devpath_present()`/事件解析与真实设备数据吻合。
 3. **真机验收**：VM 运行中逐项验证 K6 蓝牙切换、8BitDo 开关机、VM 关机释放。
 
@@ -255,7 +258,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 ## 12. 已知限制与权衡
 
 1. **同 VID:PID 的多台设备无法区分**（如两个同型号手柄），直通匹配第一台。需要精确到端口时可扩展 hostdev XML 加地址，但 DEVNUM 变化会使其失效，需配合对账刷新——权衡后保持 vendor/product。
-2. **对账的覆盖边界**：30s 对账清理"已直通但物理已不存在"的僵尸条目；"重枚举后残留失效条目"由 add 事件路径恢复（正常插拔/切换都会产生事件）。若守护进程恰好在重插瞬间重启而丢事件，下次重插或 VM 重启即自愈。
+2. **对账的覆盖边界**：30s 对账清理"已直通但物理已不存在"的僵尸条目，并通过地址比对恢复"重枚举后残留失效条目"（设备在位但 guest 没有）——守护进程晚启动、停机期间丢事件都能自愈。唯一剩下的盲区：设备在位、VM 条目地址恰好缺失（`None`）且从未有过 add 事件——保守跳过，靠下次重插或 VM 重启收敛。
 3. **30s 对账延迟**：VM 刚启动、设备已插着的场景最迟 30s 内补直通。可加 libvirt qemu hook（`started` 时执行 `--reconcile-once`）做到即时，作为可选增强。
 4. **Windows 侧重枚举掉线**：设备每次物理重枚举（休眠唤醒、模式切换）Windows 都会掉线重连一次，这是 USB 物理行为，无法避免；守护进程保证不放大抖动、不误取消。
 5. **Razer 鼠标开关切换不可见**（见 6.3 末尾）：VM 运行期间 dongle 归 VM，宿主用鼠标请走蓝牙。
