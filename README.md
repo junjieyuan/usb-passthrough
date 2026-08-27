@@ -19,6 +19,8 @@
 | `test_replay.py` | 回放验证状态机（**零文件依赖**：33 个真实捕获事件内嵌在代码里；不操作真实设备/VM） |
 | `docs/DESIGN.md` | **详尽设计文档与决策记录**（每条设计决策的 why；含代码地图、真实事件走查、领域知识、术语表） |
 | `docs/DEVELOPMENT.md` | **开发指南**（接手开发必读：环境、测试体系、加设备流程、踩坑清单、提交约定） |
+| `LICENSE` | MIT License |
+| `.github/workflows/test.yml` | CI：push/PR 自动跑语法检查 + 回放测试（零依赖） |
 
 > 👷 要参与开发？先读 `docs/DEVELOPMENT.md`，再配合 `docs/DESIGN.md`。
 

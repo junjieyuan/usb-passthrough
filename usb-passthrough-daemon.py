@@ -495,6 +495,9 @@ class Daemon:
     def run(self):
         log.info("starting USB passthrough daemon (VM=%s, allowed=%s)",
                  VM_NAME, ", ".join("%04x:%04x" % p for p in ALLOWED))
+        if not ALLOWED:
+            log.warning("USB_PT_ALLOWED is empty — no devices will ever "
+                        "be passed through (check the unit's Environment=)")
         if pyudev is None:
             log.error("python3-pyudev is required; install it "
                       "(e.g. sudo rpm-ostree install python3-pyudev) and "

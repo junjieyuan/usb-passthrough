@@ -21,7 +21,16 @@ Usage: python3 test_replay.py
 """
 
 import importlib.util
+import os
 import sys
+
+# Pin configuration BEFORE loading the daemon module: the daemon reads these
+# from the environment at import time, and a shell that exports e.g.
+# USB_PT_ALLOWED (for the systemd unit) would otherwise change test behavior.
+os.environ["USB_PT_ALLOWED"] = "05ac:024f,1532:0083,2dc8:3106"
+os.environ["USB_PT_IDLE"] = "2dc8:3109"
+os.environ["USB_PT_SETTLE"] = "1.0"
+os.environ["USB_PT_DEBOUNCE"] = "1.0"
 
 spec = importlib.util.spec_from_file_location(
     "usb_pt", "usb-passthrough-daemon.py")

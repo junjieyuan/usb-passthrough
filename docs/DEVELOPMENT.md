@@ -78,6 +78,8 @@ python3 -m py_compile usb-passthrough-daemon.py test_replay.py
 python3 test_replay.py
 ```
 
+**CI**：仓库带 `.github/workflows/test.yml`——每次 push / PR 自动跑上述两步（测试零依赖，runner 不需要 pyudev/libvirt）。PR 前保证本地同样通过即可。
+
 ## 6. 开发时的坑（全部是本项目踩过的真坑）
 
 | 坑 | 正确做法 |
