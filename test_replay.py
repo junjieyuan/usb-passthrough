@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Replay captured USB hotplug events through the passthrough state machine.
 
 Self-contained: the 33 events below were captured with
