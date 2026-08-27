@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""usb-passthrough-daemon.py — hot-plug USB input devices into a Windows VM.
+"""usb-passthrough-daemon.py — hot-plug USB input devices into a VM (guest).
 
 Watches USB hotplug events (usb_device level) for allowed keyboards / mice /
 gamepads. While the target VM is running:
@@ -52,7 +52,9 @@ except ImportError:
 # Configuration (all overridable via environment)
 # ---------------------------------------------------------------------------
 
-VM_NAME = os.environ.get("USB_PT_VM", "windows")
+# Required: the target VM name and the allowlist come exclusively from the
+# environment. The daemon refuses to start without them (see main()).
+VM_NAME = os.environ.get("USB_PT_VM")
 
 
 def _parse_pairs(s):
@@ -69,12 +71,12 @@ def _parse_pairs(s):
     return out
 
 
-# Devices to pass through: comma-separated "vid:pid" hex pairs.
-ALLOWED = _parse_pairs(os.environ.get(
-    "USB_PT_ALLOWED", "05ac:024f,1532:0083,2dc8:3106"))
+# Devices to pass through: comma-separated "vid:pid" hex pairs (required).
+ALLOWED = _parse_pairs(os.environ.get("USB_PT_ALLOWED", ""))
 
 # "Idle" states of the same hardware that must never be attached (log only).
-KNOWN_IDLE = _parse_pairs(os.environ.get("USB_PT_IDLE", "2dc8:3109"))
+# Optional: empty by default, no hardcoded devices.
+KNOWN_IDLE = _parse_pairs(os.environ.get("USB_PT_IDLE", ""))
 
 SETTLE_SEC = float(os.environ.get("USB_PT_SETTLE", "1.0"))
 REMOVE_DEBOUNCE_SEC = float(os.environ.get("USB_PT_DEBOUNCE", "1.0"))
@@ -551,10 +553,17 @@ def main():
     if "--debug" in sys.argv:
         logging.getLogger().setLevel(logging.DEBUG)
     daemon = Daemon()
+    missing = []
+    if not VM_NAME:
+        missing.append("USB_PT_VM")
     if not ALLOWED:
+        missing.append("USB_PT_ALLOWED")
+    if missing:
         # covers both the daemon loop and --reconcile-once
-        log.warning("USB_PT_ALLOWED is empty — no devices will ever "
-                    "be passed through (check the unit's Environment=)")
+        log.error("refusing to start: required environment variables not set: %s "
+                  "(set them in the systemd unit's Environment= or the shell)",
+                  ", ".join(missing))
+        return 1
     if "--reconcile-once" in sys.argv:
         daemon.reconcile()
         return 0

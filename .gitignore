@@ -1,3 +1,31 @@
+# 规划/工具目录（本地生成，不入库）
+.trae/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+venv/
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# 项目测试临时目录
 .pyudev-test/
+
+# 编辑器 / 操作系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 环境变量 / 日志
+.env
+.env.*
+*.log
