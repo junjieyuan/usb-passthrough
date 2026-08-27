@@ -176,6 +176,8 @@ attach 前查 `dumpxml`（已在配置 → 清失效 → 重挂）；detach 前�
 
 **为什么"VM 状态未知时对账直接中止"**：`domstate` 失败 = 无法确认 VM 状态，此时 attach/detach 都可能产生错误副作用，宁可中止等下次。
 
+**手动触发即时对账**：收到 `SIGHUP` 信号后，守护进程在下一个事件循环迭代立即执行一次对账（`sudo systemctl kill -s HUP usb-passthrough`），不需要等 30s 周期——用于部署验证或紧急恢复。
+
 **内存卫生**：对账会删除"非白名单且已不在总线上"的设备记录（避免长期运行后记录无限增长）；白名单记录保留，因为可能有未触发的去抖定时器要查它。
 
 ---
@@ -240,6 +242,8 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 | 1 | 守护进程一直报 "VM not running"，但 VM 明明在跑 | 中文 locale 下 `virsh domstate` 输出 `运行`，与 `"running"` 比较失败 | 所有 virsh 调用强制 `LC_ALL=C` | 状态名/错误信息稳定为英文，且新增状态日志（非 running 时打印实际状态）便于诊断 |
 | 2 | detach 报 `打开文件 '-' 失败` | 该 virsh 版本不认 `-` 标准输入，把 `-` 当文件名 open | 改用临时文件传 XML | 兼容所有 virsh 版本，用完即删无残留 |
 | 3 | （代码审查发现）对账先 attach 后，残留 settle 定时器再触发一次 detach+attach 抖动 | 对账与事件路径竞态 | 对账 attach 成功后取消该端口残留的 settle 定时器 | 避免无谓的 Windows 设备掉线重连 |
+| 4 | （代码审查发现）对账读 VM 配置瞬时失败（dumpxml 出错返回 None）时未防护，`(vid,pid) in attached` 直接 TypeError | `vm_attached_devices()` 返回 None 未检查 | reconcile 增加 `attached is None → 安全中止，下周期重试` | 与"状态未知不动作"同原则：读不到配置宁可中止，绝不基于错误数据动作（其他调用点本就有防护，唯独 reconcile 漏了） |
+| 5 | （代码审查发现）对账失配重挂后，残留 settle 定时器再次触发 detach+attach | 失配分支漏了 `clear_timer`（普通 attach 分支有） | 失配重挂后同步取消该端口 settle 定时器，并置 `rec["attached"]=False` 再按结果更新 | 与对账普通 attach 分支对称，避免无谓抖动；状态字段与实际一致 |
 
 ---
 
@@ -252,6 +256,11 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 3. **真机验收**：VM 运行中逐项验证 K6 蓝牙切换、8BitDo 开关机、VM 关机释放。
 
 **为什么 mock 而不是真连**：回放测试要锁定"状态机逻辑"，不依赖 libvirt 环境；真机行为用上述第 3 步单独验证。
+
+4. **真机验收记录**（本机实测通过）：
+   - **locale 误判**：中文 locale 下 `domstate windows` 返回 `运行` → `LC_ALL=C` 修复后，对账正确识别 VM 运行并开始 attach；
+   - **virsh `-` 标准输入**：报 `打开文件 '-' 失败` → 改临时文件后 detach 成功（运行态僵尸条目 `2dc8:3106`/`05ac:024f` 被正确清除）；
+   - **全链路行为**：K6 插回 → `add → attached`（对账路径，settle 定时器正确取消）；K6 切蓝牙 → `remove → 去抖 → detached`（宿主蓝牙可用）；8BitDo 开机 → `add 2dc8:3106 → attached`（事件路径）；8BitDo 关机 → `idle-mode 2dc8:3109 ignored`（不抖动）；Windows 内键鼠/手柄均正常；VM 关闭 → 键鼠即时归还宿主。
 
 ---
 

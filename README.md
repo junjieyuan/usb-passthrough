@@ -55,7 +55,7 @@ VM 名不是 `windows` 的话，编辑 `/etc/systemd/system/usb-passthrough.serv
 3. 设备身份用 **`PRODUCT`（vid/pid）** + **`DEVPATH`（端口路径）**，绝不用 DEVNUM（每次重枚举都会变，见 8BitDo 045→052、Razer 004→053）；
 4. **add**：命中允许清单 → 等 1s（settle，等接口枚举完）→ VM running？→ attach（幂等；失败重试 3 次）；
 5. **remove**：去抖 1s——同端口重新出现（= 8BitDo 模式切换/休眠唤醒/抖动等重枚举）就跳过取消；确认消失 → VM running？→ detach（设备已物理消失也容错）；
-6. **每 30s 对账**：物理设备清单 vs VM 的 hostdev 清单，补 attach、清僵尸条目；
+6. **每 30s 对账**：物理设备清单 vs VM 的 hostdev 清单——补 attach、清僵尸条目，外加**地址比对**（VM 条目记录的 bus/device ≠ 设备当前值 = 重枚举过 = 条目失效 → 先清再挂）；
 7. **状态未知（libvirtd 挂了）时不动作**，宁可等下次对账，绝不错 detach。
 
 ### 允许清单（环境变量覆盖）
@@ -96,6 +96,30 @@ python3 test_replay.py
 # 单次对账（安全，可随时跑）
 sudo /usr/local/sbin/usb-passthrough-daemon.py --reconcile-once --debug
 ```
+
+## 运维
+
+- **手动触发即时对账**（不等 30s 周期）：`sudo systemctl kill -s HUP usb-passthrough`
+- **升级/重新部署**（改了代码后）：
+  ```bash
+  sudo install -m 755 usb-passthrough-daemon.py /usr/local/sbin/
+  sudo systemctl restart usb-passthrough
+  ```
+
+## 日志速查（故障排查）
+
+| 日志行 | 含义 |
+|---|---|
+| `event source: pyudev (libudev, kernel uevent socket)` | 事件源正常 |
+| `VM windows state is 'shut off' (not running)` | 诊断行：VM 状态不是 running（VM 关着时正常出现） |
+| `add 05ac:024f ... (settle 1.0s)` | 设备插入，等 1s 后直通 |
+| `attached 05ac:024f to windows` | 直通成功 |
+| `remove ... (debounce 1.0s)` → `detached ...` | 真拔除，已取消直通 |
+| `... re-enumerated, skipping detach` | 去抖判定为重枚举（模式切换/休眠唤醒），不取消 |
+| `idle-mode device 2dc8:3109 ... ignored` | 8BitDo IDLE，永不直通 |
+| `reconcile: hostdev 2dc8:3106 resolved at (5, 47) but device now at (5, 48) — stale entry, re-attaching` | 对账发现失效条目，先清再挂 |
+| `attach ... failed:` | attach 失败（自动重试 3 次，仍失败交给下次对账） |
+| `python3-pyudev is required` | 缺依赖，装 pyudev 后重启服务 |
 
 ## 注意事项 / 已知限制
 
