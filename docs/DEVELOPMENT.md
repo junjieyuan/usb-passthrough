@@ -9,9 +9,9 @@
 ## 1. 环境准备
 
 - **系统**：Linux（Fedora 系实测；systemd + libvirt 环境即可）
-- **Python 3.11+**；生产依赖 `python3-pyudev`（唯一事件源）
-- **测试不需要 pyudev**：`test_replay.py` 把 pyudev/sysfs/virsh 全部 mock 掉，裸 Python 就能跑
-- **真机验证**需要：`virsh`（libvirt-client）、一个目标 KVM 虚拟机（名称由 `USB_PT_VM` 指定）、`python3-pyudev`
+- **Python 3.11+**；生产依赖 `python3-pyudev`（唯一事件源）+ `python3-libvirt`（VM 动作层）。`python3-libvirt` 版本必须与 libvirtd 配对——**用发行版包安装**（`rpm-ostree install python3-libvirt` / `dnf install python3-libvirt`），不要 pip 装
+- **测试不需要 pyudev/libvirt**：`test_replay.py` 把 pyudev/sysfs/libvirt 动作函数全部 mock 掉，裸 Python 就能跑
+- **真机验证**需要：`python3-pyudev` + `python3-libvirt`（绑定代替 virsh）、一个目标 KVM 虚拟机（名称由 `USB_PT_VM` 指定）
 
 ```bash
 git clone git@github.com:junjieyuan/usb-passthrough.git && cd usb-passthrough
@@ -25,7 +25,7 @@ python3 test_replay.py                                            # 回放测试
 # 1) 跑测试（不需要任何依赖）
 python3 test_replay.py
 
-# 2) 真机单次对账（需要 pyudev + virsh；只读+可能 attach/detach，安全）
+# 2) 真机单次对账（需要 pyudev + python3-libvirt；只读+可能 attach/detach，安全）
 sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
   /usr/local/sbin/usb-passthrough-daemon.py --reconcile-once --debug
 
@@ -60,7 +60,7 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 |---|---|
 | `EVENTS` | 内嵌真实事件 `(时间戳, action, devpath, PRODUCT)`（含无线设备全部模式切换；来源为作者真机捕获，详见 AUTHOR_DEPLOYMENT.md） |
 | `SEED` | 模拟"守护进程启动前设备已在位且已直通"（否则首个事件会被当作 untracked） |
-| mocks | `vm_running`/`vm_attached_devices`/`scan_physical_devices`/`attach_device`/`detach_device`/`devpath_present`/`time` 全部替换为测试替身；场景函数经 `save_mocks()`/`restore_mocks()` 打补丁并复位 |
+| mocks | `vm_snapshot`/`scan_physical_devices`/`attach_device`/`detach_device`/`devpath_present`/`time` 全部替换为测试替身；`vm_snapshot` mock 为 `lambda: (running, attached)`（两维独立控制）；场景函数经 `save_mocks()`/`restore_mocks()` 打补丁并复位 |
 | `replay_main_flow()` | 回放 `EVENTS` 并断言主路径行为。回放循环每个事件：先 `fire_timers()`（触发到期定时器）→ 更新 fake sysfs → `handle_event()`。**顺序不能反**：去抖/settle 的判定依赖"定时器先于事件生效" |
 | `scenario_*()` | 定向场景函数（清单见 §5.2），各自返回 `[(断言名, 通过, 说明)]` |
 | `report()` | 汇总打印全部 `PASS/FAIL` 并决定退出码（有任一 FAIL 则 exit 1） |
@@ -73,7 +73,7 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 
 **方式 B（定向场景）**：不依赖 `EVENTS`，新增或修改 `scenario_*()` 函数：单独构造 `Daemon` + 定向 mock（打完补丁必须 `restore_mocks()` 复位，否则污染后续场景）。参考现有场景：
 - `scenario_stale_entry_recovery`（事件路径：add → 配置里有失效条目 → 先清再挂）
-- `scenario_reconcile_stale_address`（对账路径：XML 记录地址 ≠ 设备当前地址 → 恢复；含地址匹配 no-churn 与 dumpxml 失败安全中止）
+- `scenario_reconcile_stale_address`（对账路径：XML 记录地址 ≠ 设备当前地址 → 恢复；含地址匹配 no-churn 与 VM 配置读取失败安全中止）
 - `scenario_event_filtering`（hub / change / bind / unbind / 错误 DEVTYPE 全部忽略）
 - `scenario_bad_product_ignored`（PRODUCT 缺失/不可解析/单段不崩）
 - `scenario_untracked_remove_listed`（未跟踪设备的 remove 即时清理；VM 未运行时不动）
@@ -100,16 +100,18 @@ python3 test_replay.py
 |---|---|
 | 用 DEVNUM 匹配设备 | 用 **DEVPATH（端口路径）+ PRODUCT（vid/pid）**——DEVNUM 每次重枚举都变 |
 | 把 `change`/`bind` 当插入事件 | 只认 **`add`/`remove`**（一次插入发 add→change→bind 三连） |
-| 认为 `domstate` 输出是英文 | 所有 virsh 调用强制 **`LC_ALL=C`**（非英文 locale 输出 `运行`，字符串比较失败） |
-| 用 `-` 把 XML 传给 virsh | 写**临时文件**（实测该 virsh 版本把 `-` 当文件名 open，报"打开文件 '-' 失败"） |
-| 把 `vm_running()` 的 `None` 当"没运行" | **`None` = 状态未知，绝不动作**（attach/detach 都跳过，等对账） |
+| pip 装 `python3-libvirt` | 用**发行版包**装（版本必须与 libvirtd 配对，pip 版本错配会 ABI 报错；见 DESIGN.md §8.2） |
+| 缓存 libvirt 连接跨 libvirtd 重启复用 | 每次调用开**短连接**现开现关——libvirtd 重启在下一次调用天然自愈，无需重连逻辑（DESIGN.md §8.5） |
+| 以为 python 绑定暴露 `listHostdevs()`（C API 5.7 起有 `virDomainListHostdevs`） | 实测 `'virDomain' object has no attribute 'listHostdevs'`（libvirtd 12.0.0）——绑定不暴露，用 **`XMLDesc(0)` + `_parse_hostdev_map` 解析**（DESIGN.md §8.2 决策记录） |
+| 直接 `setKeepAlive` 不注册事件循环 | 模块导入时先 `libvirt.virEventRegisterDefaultImpl()`，否则每次连接 stderr 刷 "caller doesn't support keepalive protocol" 且 keepalive 失效 |
+| 把 `vm_snapshot()` 的 `running=None` 当"没运行" | **`None` = 状态未知，绝不动作**（attach/detach 都跳过，等对账） |
 | 用 `dev.get()`（pyudev） | 用 **`dev.properties.get()`**（0.24.1 起弃用，1.0 移除） |
 | 对账只看"设备在不在 VM 配置里" | 还要**地址比对**（配置里有条目 ≠ 可用——设备重枚举后条目是死的） |
 | 以为 VM 重启设备会自动回来 | libvirt **不会**自动恢复重枚举——这是本项目的存在理由 |
 | 在 udev 规则里做状态逻辑 | 用守护进程 + 对账（有 settle/去抖/对账等状态，规则做不了） |
 | 给守护进程写死默认设备/VM 名 | **只从环境变量读取**（`USB_PT_VM`/`USB_PT_ALLOWED` 必填，缺失拒绝启动） |
 | 对账先 attach 后，残留 settle 定时器再触发一次 detach+attach 抖动 | 对账 attach 成功后**取消该端口残留的 settle 定时器**（避免客户机设备无谓掉线重连） |
-| 对账读 VM 配置瞬时失败（dumpxml 返回 `None`）未防护，`(vid,pid) in attached` 直接 TypeError | 检查 `attached is None`→**安全中止等下周期**（与"状态未知不动作"同原则） |
+| 对账读 VM 配置瞬时失败（`vm_snapshot()` 的 attached 返回 `None`）未防护，`(vid,pid) in attached` 直接 TypeError | 检查 `attached is None`→**安全中止等下周期**（与"状态未知不动作"同原则） |
 | 对账地址失配重挂后，残留 settle 定时器再次触发 detach+attach | 失配重挂后同步取消该端口 settle 定时器（`_heal_attach` 的失配分支成功与失败都取消），`attached` 状态按 attach 结果更新 |
 
 > 本表是本仓库踩坑的**单一权威来源**（DESIGN.md §10 已改为指向此处）；AGENTS.md 保留一份精简速查版。

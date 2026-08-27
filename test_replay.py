@@ -7,7 +7,7 @@ Self-contained: the 33 events below were captured with
 real hardware (Keychron K6 keyboard, Razer Basilisk X mouse, 8BitDo Ultimate
 gamepad) and embedded here, so the test needs no external files.
 
-Uses mocked virsh/sysfs, so nothing real is touched.
+Uses mocked libvirt/sysfs, so nothing real is touched.
 
 Structure: replay_main_flow() replays the embedded event stream through the
 state machine; a set of scenario_*() functions exercises targeted paths
@@ -59,8 +59,7 @@ attached_log = []   # [(vid, pid), ...] in order
 detached_log = []   # [(vid, pid), ...] in order
 fake_sysfs = {}     # devpath -> present?
 
-d.vm_running = lambda: True
-d.vm_attached_devices = lambda: {}
+d.vm_snapshot = lambda: (True, {})
 d.attach_device = lambda vid, pid: attached_log.append((vid, pid)) or True
 d.detach_device = lambda vid, pid: detached_log.append((vid, pid)) or True
 
@@ -73,12 +72,12 @@ d.devpath_present = fake_present
 
 
 def save_mocks():
-    return (d.vm_running, d.vm_attached_devices, d.attach_device,
+    return (d.vm_snapshot, d.attach_device,
             d.detach_device, d.scan_physical_devices, d.pyudev)
 
 
 def restore_mocks(saved):
-    (d.vm_running, d.vm_attached_devices, d.attach_device,
+    (d.vm_snapshot, d.attach_device,
      d.detach_device, d.scan_physical_devices, d.pyudev) = saved
 
 
@@ -195,13 +194,13 @@ def replay_main_flow():
 def scenario_stale_entry_recovery():
     """The VM config still lists a hostdev whose device re-enumerated
     (libvirt never auto-recovers). On re-add the daemon must clear the stale
-    entry FIRST, then attach fresh. The main replay mocks vm_attached_devices
-    as empty, so this path is exercised explicitly here."""
+    entry FIRST, then attach fresh. The main replay mocks vm_snapshot
+    with an empty map, so this path is exercised explicitly here."""
     STALE_DP = "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3"
     results = []
     saved = save_mocks()
     try:
-        d.vm_attached_devices = lambda: {(0x2DC8, 0x3106): None}  # stale entry in VM config (no recorded address)
+        d.vm_snapshot = lambda: (True, {(0x2DC8, 0x3106): None})  # stale entry in VM config (no recorded address)
         stale_detached = []
         stale_attached = []
         d.detach_device = lambda vid, pid: stale_detached.append((vid, pid)) or True
@@ -236,8 +235,7 @@ def scenario_reconcile_stale_address():
     saved = save_mocks()
     try:
         d.pyudev = object()  # satisfy reconcile()'s pyudev-required guard
-        d.vm_running = lambda: True
-        d.vm_attached_devices = lambda: {(0x2DC8, 0x3106): (5, 47)}  # resolved at old enumeration
+        d.vm_snapshot = lambda: (True, {(0x2DC8, 0x3106): (5, 47)})  # resolved at old enumeration
         d.scan_physical_devices = lambda: {REC_DP: (0x2DC8, 0x3106, 5, 48)}  # re-enumerated
         rec_detached = []
         rec_attached = []
@@ -253,7 +251,7 @@ def scenario_reconcile_stale_address():
                         f"(detached={rec_detached}, attached={rec_attached})"))
 
         # healthy case: recorded address matches the current device -> no churn
-        d.vm_attached_devices = lambda: {(0x2DC8, 0x3106): (5, 48)}
+        d.vm_snapshot = lambda: (True, {(0x2DC8, 0x3106): (5, 48)})
         rec_detached.clear()
         rec_attached.clear()
         r2 = d.Daemon()
@@ -262,8 +260,8 @@ def scenario_reconcile_stale_address():
                         not rec_detached and not rec_attached,
                         "no detach/attach churn"))
 
-        # dumpxml failure -> reconcile aborts cleanly instead of crashing
-        d.vm_attached_devices = lambda: None
+        # VM config unreadable -> reconcile aborts cleanly instead of crashing
+        d.vm_snapshot = lambda: (True, None)
         d.scan_physical_devices = lambda: {REC_DP: (0x2DC8, 0x3106, 5, 48)}
         rec_detached.clear()
         rec_attached.clear()
@@ -324,8 +322,7 @@ def scenario_untracked_remove_listed():
     saved = save_mocks()
     det = []
     try:
-        d.vm_running = lambda: True
-        d.vm_attached_devices = lambda: {(0x1532, 0x0083): (5, 47)}
+        d.vm_snapshot = lambda: (True, {(0x1532, 0x0083): (5, 47)})
         d.detach_device = lambda vid, pid: det.append((vid, pid)) or True
         s = d.Daemon()
         s.handle_event({"action": "remove", "DEVTYPE": "usb_device",
@@ -334,7 +331,7 @@ def scenario_untracked_remove_listed():
                         "remove of an untracked allowed device still listed "
                         "in the VM config should detach"))
         det.clear()
-        d.vm_running = lambda: False
+        d.vm_snapshot = lambda: (False, {})
         s2 = d.Daemon()
         s2.handle_event({"action": "remove", "DEVTYPE": "usb_device",
                          "devpath": "/devices/unknown", "PRODUCT": "1532/83/200"})
@@ -346,13 +343,14 @@ def scenario_untracked_remove_listed():
 
 
 def scenario_attach_vm_unknown_skip():
-    """vm_running()=None means unknown state: settle must skip the attach."""
+    """vm_snapshot() returning running=None means unknown state: settle must
+    skip the attach."""
     results = []
     saved = save_mocks()
     att = []
     DP = "/devices/unk"
     try:
-        d.vm_running = lambda: None
+        d.vm_snapshot = lambda: (None, None)
         d.attach_device = lambda vid, pid: att.append((vid, pid)) or True
         fake_sysfs[DP] = True
         s = d.Daemon()
@@ -363,7 +361,7 @@ def scenario_attach_vm_unknown_skip():
         rec = s.devices[DP]
         results.append(("attach skipped when VM unknown",
                         not att and rec is not None and rec.present,
-                        "vm_running()=None must skip attach and not crash"))
+                        "running=None must skip attach and not crash"))
     finally:
         fake_sysfs.pop(DP, None)
         restore_mocks(saved)
@@ -377,8 +375,7 @@ def scenario_attach_exhausts_retries():
     saved = save_mocks()
     DP = "/devices/retry"
     try:
-        d.vm_running = lambda: True
-        d.vm_attached_devices = lambda: {}
+        d.vm_snapshot = lambda: (True, {})
         d.attach_device = lambda vid, pid: False
         fake_sysfs[DP] = True
         s = d.Daemon()
@@ -415,7 +412,7 @@ def scenario_reconcile_vm_not_running():
     DP = "/devices/rc"
     try:
         d.pyudev = object()
-        d.vm_running = lambda: False
+        d.vm_snapshot = lambda: (False, {})
         d.scan_physical_devices = lambda: {DP: (0x2DC8, 0x3106, 5, 48)}
         att, det = [], []
         d.attach_device = lambda vid, pid: att.append((vid, pid)) or True

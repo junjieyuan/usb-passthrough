@@ -12,7 +12,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `usb-passthrough-daemon.py` | 主程序（Python 3 标准库；依赖 `python3-pyudev`，唯一事件源） |
+| `usb-passthrough-daemon.py` | 主程序（Python 3 标准库；依赖 `python3-pyudev`（唯一事件源）+ `python3-libvirt`（VM 动作层）） |
 | `usb-passthrough.service` | systemd 单元（通用模板，需配置必需环境变量） |
 | `test_replay.py` | 回放验证状态机（**零文件依赖**：真实捕获事件内嵌在代码里；不操作真实设备/VM） |
 | `docs/DESIGN.md` | 设计文档与决策记录（每条设计决策的 why；含代码地图、领域知识、术语表） |
@@ -44,20 +44,22 @@ Environment=USB_PT_ALLOWED=1234:5678
 
 然后 `sudo systemctl daemon-reload && sudo systemctl restart usb-passthrough`。
 
-**依赖：`python3-pyudev`（唯一事件源，无回退）**——守护进程直接用 libudev 监控内核 uevent（无子进程、无文本解析），没装会拒绝启动：
+**依赖：`python3-pyudev`（唯一事件源，无回退）+ `python3-libvirt`（VM 动作层，无回退）**——守护进程直接用 libudev 监控内核 uevent，用 libvirt python 绑定执行 attach/detach/状态查询（无 virsh 子进程、无文本解析），缺一即拒绝启动：
 
 ```bash
 # Fedora Silverblue（不可变系统，需 rpm-ostree）
-sudo rpm-ostree install python3-pyudev
+sudo rpm-ostree install python3-pyudev python3-libvirt
 sudo systemctl restart usb-passthrough   # 或重启系统后生效
 
 # 普通 Fedora / Arch 等
-sudo dnf install python3-pyudev          # Arch: sudo pacman -S python-pyudev
+sudo dnf install python3-pyudev python3-libvirt   # Arch: sudo pacman -S python-pyudev libvirt-python
 ```
+
+> 注意：`python3-libvirt` 的版本必须与运行中的 libvirtd 配对——**用发行版包安装**（如上），不要用 pip 装（版本不配对会导致 ABI 报错）。
 
 启动日志确认事件源：`event source: pyudev (libudev, kernel uevent socket)`。
 
-> 📖 每条设计决策背后的"为什么"（为什么用 DEVPATH 不用 DEVNUM、为什么去抖、为什么先清失效条目再直通、为什么 `LC_ALL=C`、为什么临时文件传 XML……）见 **`docs/DESIGN.md`**。
+> 📖 每条设计决策背后的"为什么"（为什么用 DEVPATH 不用 DEVNUM、为什么去抖、为什么先清失效条目再直通、为什么用 libvirt python 绑定而不是 virsh 子进程……）见 **`docs/DESIGN.md`**。
 
 ## 工作原理
 
@@ -85,7 +87,7 @@ sudo dnf install python3-pyudev          # Arch: sudo pacman -S python-pyudev
 
 ## 与 virt-manager 配合（推荐用法）
 
-- 可保留 virt-manager 里的持久 hostdev 配置（VM 开机时 libvirt 自动直通）——**不冲突**：守护进程的 attach/detach 都只加 `--live`（不动持久配置），动作前先查 VM 当前配置，幂等；
+- 可保留 virt-manager 里的持久 hostdev 配置（VM 开机时 libvirt 自动直通）——**不冲突**：守护进程的 attach/detach 都只用 `--live`（绑定对应 `VIR_DOMAIN_AFFECT_LIVE`，不动持久配置），动作前先查 VM 当前配置，幂等；
 - 守护进程负责**运行期恢复**：设备物理重枚举后，virt-manager 不会自动重新直通（libvirt 的 hostdev 条目在设备重枚举后变成失效条目，不会自愈）——守护进程在 `add` 事件后自动"先清掉失效条目再重新直通"；
 - 检查持久 hostdev XML 时区分两种 `<address>`：
   - `<source>` **里面**的 `<address type='usb' bus='..' device='..'/>` 是**宿主侧**地址（对应 /dev/bus/usb 的 DEVNUM），重枚举后必然失效——**必须删掉**，只按 `<vendor>`/`<product>` 匹配；
@@ -116,7 +118,7 @@ sudo /usr/local/sbin/usb-passthrough-daemon.py --reconcile-once --debug
 | 日志行 | 含义 |
 |---|---|
 | `event source: pyudev (libudev, kernel uevent socket)` | 事件源正常 |
-| `VM <name> state is 'shut off' (not running)` | 诊断行：VM 状态不是 running（VM 关着时正常出现） |
+| `VM <name> not running (state=5)` | 诊断行：VM 状态不是 running（5=shutoff；VM 关着时正常出现） |
 | `refusing to start: required environment variables not set: ...` | 缺少必需环境变量（检查 .service 的 Environment=） |
 | `add <vid:pid> ... (settle 1.0s)` | 设备插入，等 1s 后直通 |
 | `attached <vid:pid> to <vm>` | 直通成功 |
@@ -124,7 +126,9 @@ sudo /usr/local/sbin/usb-passthrough-daemon.py --reconcile-once --debug
 | `... re-enumerated, skipping detach` | 去抖判定为重枚举（模式切换/休眠唤醒），不取消 |
 | `reconcile: hostdev <vid:pid> resolved at (5, 47) but device now at (5, 48) — stale entry, re-attaching` | 对账发现失效条目，先清再挂 |
 | `attach ... failed:` | attach 失败（自动重试 3 次，仍失败交给下次对账） |
-| `python3-pyudev is required` | 缺依赖，装 pyudev 后重启服务 |
+| `libvirt connection failed: ...` | libvirtd 不可用/未启动；状态未知，跳过动作等下次对账 |
+| `python3-pyudev is required` / `python3-libvirt is required` | 缺依赖，装对应包后重启服务 |
+| `python3-libvirt unavailable` | 仅 `--reconcile-once` 手动执行且未装 libvirt 包时出现；装发行版包即可 |
 
 ## 注意事项 / 已知限制
 
