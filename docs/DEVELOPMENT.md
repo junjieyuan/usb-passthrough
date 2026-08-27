@@ -38,7 +38,7 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 
 | 文件 | 作用 |
 |---|---|
-| `usb-passthrough-daemon.py` | 唯一程序文件：配置层 → libvirt 动作层 → sysfs 层 → 状态机 `Daemon` → 入口 `main`（**逐函数地图见 DESIGN.md §14**） |
+| `usb-passthrough-daemon.py` | 唯一程序文件：配置层 → libvirt 动作层 → sysfs 层 → 状态机 `Daemon`（每端口设备记录为 `DeviceState` dataclass）→ 入口 `main`（**逐函数地图见 DESIGN.md §14**） |
 | `test_replay.py` | 自包含回放测试：真实捕获事件内嵌 + mock，多项断言 |
 | `usb-passthrough.service` | systemd 单元（通用模板；`After=libvirtd`、`Restart=always`，需配 `Environment=`） |
 
@@ -47,8 +47,8 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 1. 确定设备的 **vid:pid**（`lsusb`）；
 2. 观察其**重枚举行为**：拔插/模式切换时跑
    `udevadm monitor --property --udev --subsystem-match=usb/usb_device`，
-   确认有没有"空闲/未连接"状态（无线接收器常见——**这种状态要进 `USB_PT_IDLE`，绝不能进 `USB_PT_ALLOWED`**）；
-3. 改配置：在 systemd 单元的 `Environment=USB_PT_ALLOWED=`（及需要时 `USB_PT_IDLE=`）里加入该设备（**已无代码默认值**）；
+   确认有没有"空闲/未连接"状态（无线接收器常见——**这种状态绝不能进 `USB_PT_ALLOWED`，保持不配置、由守护进程无视即可**）；
+3. 改配置：在 systemd 单元的 `Environment=USB_PT_ALLOWED=` 里加入该设备的**真实状态**（**已无代码默认值**）；
 4. 验证：`python3 test_replay.py` + 真机 `--reconcile-once --debug`；
 5. 加测试（见 §5.2），保证新设备的重枚举行为被断言锁定。
 
@@ -60,9 +60,10 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 |---|---|
 | `EVENTS` | 内嵌真实事件 `(时间戳, action, devpath, PRODUCT)`（含无线设备全部模式切换；来源为作者真机捕获，详见 AUTHOR_DEPLOYMENT.md） |
 | `SEED` | 模拟"守护进程启动前设备已在位且已直通"（否则首个事件会被当作 untracked） |
-| mocks | `vm_running`/`vm_attached_devices`/`scan_physical_devices`/`attach_device`/`detach_device`/`devpath_present`/`time` 全部替换为测试替身 |
-| 回放循环 | 每个事件：先 `fire_timers()`（触发到期定时器）→ 更新 fake sysfs → `handle_event()`。**顺序不能反**：去抖/settle 的判定依赖"定时器先于事件生效" |
-| `checks` | 断言列表，全部 PASS 才 exit 0 |
+| mocks | `vm_running`/`vm_attached_devices`/`scan_physical_devices`/`attach_device`/`detach_device`/`devpath_present`/`time` 全部替换为测试替身；场景函数经 `save_mocks()`/`restore_mocks()` 打补丁并复位 |
+| `replay_main_flow()` | 回放 `EVENTS` 并断言主路径行为。回放循环每个事件：先 `fire_timers()`（触发到期定时器）→ 更新 fake sysfs → `handle_event()`。**顺序不能反**：去抖/settle 的判定依赖"定时器先于事件生效" |
+| `scenario_*()` | 定向场景函数（清单见 §5.2），各自返回 `[(断言名, 通过, 说明)]` |
+| `report()` | 汇总打印全部 `PASS/FAIL` 并决定退出码（有任一 FAIL 则 exit 1） |
 
 > 环境变量在 import 前固定（含 `USB_PT_VM`），保证测试环境与外部 shell 无关。
 
@@ -70,10 +71,17 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 
 **方式 A（事件流）**：往 `EVENTS` 追加 `(时间戳, action, devpath, product)`——时间戳决定 settle/去抖的时序判定，必须与真实行为一致；再在 `checks` 加断言。
 
-**方式 B（定向场景）**：不依赖 `EVENTS`，单独构造 `Daemon` + 定向 mock。参考现有专项检查块：
-- "stale-entry recovery"（事件路径：add → 配置里有失效条目 → 先清再挂）
-- "reconcile stale-address"（对账路径：XML 记录地址 ≠ 设备当前地址 → 恢复）
-- "reconcile unreadable VM config"（dumpxml 失败 → 安全中止）
+**方式 B（定向场景）**：不依赖 `EVENTS`，新增或修改 `scenario_*()` 函数：单独构造 `Daemon` + 定向 mock（打完补丁必须 `restore_mocks()` 复位，否则污染后续场景）。参考现有场景：
+- `scenario_stale_entry_recovery`（事件路径：add → 配置里有失效条目 → 先清再挂）
+- `scenario_reconcile_stale_address`（对账路径：XML 记录地址 ≠ 设备当前地址 → 恢复；含地址匹配 no-churn 与 dumpxml 失败安全中止）
+- `scenario_event_filtering`（hub / change / bind / unbind / 错误 DEVTYPE 全部忽略）
+- `scenario_bad_product_ignored`（PRODUCT 缺失/不可解析/单段不崩）
+- `scenario_untracked_remove_listed`（未跟踪设备的 remove 即时清理；VM 未运行时不动）
+- `scenario_attach_vm_unknown_skip` / `scenario_attach_exhausts_retries`（attach 的跳过与失败路径）
+- `scenario_timer_same_key_dedupe`（同 key 定时器替换不叠加）
+- `scenario_reconcile_vm_not_running`（对账边界：VM 未运行时无动作）
+- `scenario_nonallowed_ignored`（非允许清单设备——如接收器的空壳状态——的 add 不产生任何定时器或动作）
+- `scenario_env_strict`（`_env_int`：合法/缺失值正常解析；坏值——含历史小数写法 `1.0`——经子进程验证**非零退出拒绝启动**，fast fail 不兜底）
 
 **注意**：对账类测试要先把 `d.pyudev` mock 成非 None（`reconcile()` 开头有 pyudev 守卫，测试环境没装 pyudev 会直接中止）。
 
@@ -100,6 +108,11 @@ python3 test_replay.py
 | 以为 VM 重启设备会自动回来 | libvirt **不会**自动恢复重枚举——这是本项目的存在理由 |
 | 在 udev 规则里做状态逻辑 | 用守护进程 + 对账（有 settle/去抖/对账等状态，规则做不了） |
 | 给守护进程写死默认设备/VM 名 | **只从环境变量读取**（`USB_PT_VM`/`USB_PT_ALLOWED` 必填，缺失拒绝启动） |
+| 对账先 attach 后，残留 settle 定时器再触发一次 detach+attach 抖动 | 对账 attach 成功后**取消该端口残留的 settle 定时器**（避免客户机设备无谓掉线重连） |
+| 对账读 VM 配置瞬时失败（dumpxml 返回 `None`）未防护，`(vid,pid) in attached` 直接 TypeError | 检查 `attached is None`→**安全中止等下周期**（与"状态未知不动作"同原则） |
+| 对账地址失配重挂后，残留 settle 定时器再次触发 detach+attach | 失配重挂后同步取消该端口 settle 定时器（`_heal_attach` 的失配分支成功与失败都取消），`attached` 状态按 attach 结果更新 |
+
+> 本表是本仓库踩坑的**单一权威来源**（DESIGN.md §10 已改为指向此处）；AGENTS.md 保留一份精简速查版。
 
 ## 7. 提交与推送
 
@@ -110,7 +123,7 @@ python3 test_replay.py
 1. 配置 .service 的必需环境变量并部署 + 重启（见 README「安装」「运维」节）；
 2. VM 运行中逐项验证（对照 README「日志速查」）：
    - 设备切无线/拔出 → `remove → detached`；切回 → `add → attached`
-   - 空闲状态设备 → `idle-mode ... ignored`（无抖动）
+   - 接收器待机空壳（不在允许清单）→ 无动作、零抖动
    - **守护进程晚启动恢复**（本项目的核心场景）：停掉服务 → 拔插一次设备 → 启动服务 → 对账应见 `reconcile: hostdev ... resolved at ... but device now at ... — stale entry, re-attaching`
    - VM 关闭 → 设备即时归还宿主
 3. 本项目作者的具体设备验收记录见 `docs/AUTHOR_DEPLOYMENT.md`。

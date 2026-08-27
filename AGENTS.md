@@ -87,7 +87,7 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 
 验证重点（对照 README「日志速查」）：
 - 无线切换 → `remove → detached`；切回 → `add → attached`
-- 空闲状态设备 → `idle-mode ... ignored`（无抖动）
+- 接收器待机空壳（不在允许清单）→ 无任何动作、零抖动
 - **守护进程晚启动恢复**是本项目核心场景，应见 `reconcile: hostdev ... resolved at ... but device now at ... — stale entry, re-attaching`
 
 ---
@@ -112,13 +112,12 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 | 环境变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `USB_PT_VM` | ✅ | — | 目标虚拟机名称 |
-| `USB_PT_ALLOWED` | ✅ | — | 允许直通 `vid:pid`，逗号分隔（至少一个） |
-| `USB_PT_IDLE` | — | 空 | 空闲状态 `vid:pid`，永不直通，仅记日志 |
-| `USB_PT_SETTLE` | — | `1.0` | add 后等待秒数 |
-| `USB_PT_DEBOUNCE` | — | `1.0` | remove 后去抖秒数 |
+| `USB_PT_ALLOWED` | ✅ | — | 允许直通 `vid:pid`，逗号分隔（至少一个；空壳/空闲状态绝不能进此清单） |
+| `USB_PT_SETTLE` | — | `1` | add 后等待秒数（整数） |
+| `USB_PT_DEBOUNCE` | — | `1` | remove 后去抖秒数（整数） |
 | `USB_PT_RECONCILE` | — | `30` | 对账周期秒数 |
 | `USB_PT_ATTACH_RETRIES` | — | `3` | attach 失败重试次数 |
-| `USB_PT_ATTACH_RETRY_GAP` | — | `1.5` | 重试间隔秒数 |
+| `USB_PT_ATTACH_RETRY_GAP` | — | `2` | 重试间隔秒数 |
 
 ---
 
@@ -134,7 +133,7 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 | settle | add 后等待设备接口枚举完成 |
 | 去抖（debounce） | remove 后等待，区分"真拔"与"重枚举/模式切换" |
 | reconcile（对账） | 周期性对齐"物理设备清单 vs VM 配置清单" |
-| IDLE / 空闲状态 | 无线接收器未连接时的空壳状态，永不直通 |
+| IDLE / 空闲状态 | 无线接收器未连接设备时的空壳状态，不在允许清单，守护进程不做任何动作 |
 | 地址比对 | 对账用"XML 记录地址 vs 设备当前 bus/device"判断条目失效 |
 
 ---
