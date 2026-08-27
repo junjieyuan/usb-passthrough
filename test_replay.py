@@ -237,6 +237,17 @@ try:
     ok = not rec_detached and not rec_attached
     print(f"{'PASS' if ok else 'FAIL'}  reconcile matching address: no detach/attach churn")
     failed = failed or not ok
+
+    # dumpxml failure -> reconcile aborts cleanly instead of crashing
+    d.vm_attached_devices = lambda: None
+    d.scan_physical_devices = lambda: {REC_DP: (0x2DC8, 0x3106, 5, 48)}
+    rec_detached.clear()
+    rec_attached.clear()
+    r3 = d.Daemon()
+    r3.reconcile()
+    ok = not rec_detached and not rec_attached
+    print(f"{'PASS' if ok else 'FAIL'}  reconcile unreadable VM config: aborts cleanly")
+    failed = failed or not ok
 finally:
     (d.pyudev, d.vm_running, d.vm_attached_devices, d.scan_physical_devices,
      d.attach_device, d.detach_device) = saved_rec

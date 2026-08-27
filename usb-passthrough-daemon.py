@@ -422,6 +422,9 @@ class Daemon:
             return
         physical = scan_physical_devices()
         attached = vm_attached_devices() if running else {}
+        if attached is None:
+            log.warning("cannot read VM config, reconcile aborted")
+            return
 
         for devpath, (vid, pid, _bus, _dev) in physical.items():
             rec = self.devices.setdefault(devpath, {
@@ -461,8 +464,13 @@ class Daemon:
                              "device now at %s — stale entry, re-attaching",
                              vid, pid, xml_addr, (bus, dev))
                     detach_device(vid, pid)
+                    rec["attached"] = False
                     if attach_device(vid, pid):
                         rec["attached"] = True
+                    # a settle timer may still be pending for this
+                    # enumeration; it would otherwise re-run attach_if_needed
+                    # and cause a needless detach+attach churn
+                    self.clear_timer("attach:" + devpath)
                 continue
             log.info("reconcile: attaching %04x:%04x (%s)", vid, pid, devpath)
             if attach_device(vid, pid):
