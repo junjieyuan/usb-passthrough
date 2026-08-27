@@ -286,3 +286,148 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 | `USB_PT_RECONCILE` | `30` | 对账周期：30 秒内收敛所有异常，兼顾响应与开销 |
 | `USB_PT_ATTACH_RETRIES` | `3` | attach 失败重试 3 次（VM 刚启动 QEMU 未就绪时常见） |
 | `USB_PT_ATTACH_RETRY_GAP` | `1.5` | 重试间隔 1.5 秒 |
+
+---
+
+## 14. 代码地图（实现导览）
+
+> 供接手开发者快速定位。函数名与当前实现一一对应；详细 why 见对应章节。
+
+### 14.1 配置层
+
+| 符号 | 作用 |
+|---|---|
+| `VM_NAME` | 目标 VM 名（env `USB_PT_VM`，默认 `windows`） |
+| `_parse_pairs(s)` | 解析 `vid:pid` 逗号列表 → 元组列表；坏项记警告跳过（不崩溃） |
+| `ALLOWED` | 允许直通清单（env `USB_PT_ALLOWED`） |
+| `KNOWN_IDLE` | 永不直通、仅记日志的状态（env `USB_PT_IDLE`，8BitDo IDLE） |
+| `SETTLE_SEC` / `REMOVE_DEBOUNCE_SEC` / `RECONCILE_SEC` / `ATTACH_RETRIES` / `ATTACH_RETRY_GAP` | 时序与重试参数（§13） |
+
+### 14.2 libvirt 动作层
+
+| 函数 | 职责 / 关键点 |
+|---|---|
+| `_sh(cmd, ...)` | subprocess 包装；**强制 `LC_ALL=C`**（§8.5）；`FileNotFoundError`/`TimeoutExpired` → 返回 `None`；返回 `CompletedProcess` 或 `None` |
+| `vm_running()` | 三态：`True`/`False`/`None`（§8.6）；非 running 时打印 `VM ... state is ...` 诊断日志 |
+| `_xml_tempfile(xml)` | 写临时 XML 文件（§8.2，virsh 不认 `-`）；异常时清理 |
+| `hostdev_xml(vid,pid)` | 生成 vendor/product-only 的 hostdev XML（§8.1） |
+| `vm_attached_devices()` | **返回 `{(vid,pid): (bus,device) 或 None}`**；地址从 `<source>` 里提取——这是对账地址比对（§7）的数据来源 |
+| `attach_device(vid,pid)` | 重试 `ATTACH_RETRIES` 次、间隔 `ATTACH_RETRY_GAP`；成功返回 `True` |
+| `detach_device(vid,pid)` | 单次、**容错**（设备已消失/条目已不在视为正常，记日志返回 `False`） |
+
+### 14.3 sysfs 层
+
+| 函数 | 职责 |
+|---|---|
+| `devpath_present(devpath)` | `/sys + devpath` 目录是否存在——settle/去抖的**物理存在性判据**（比状态表更可靠） |
+| `scan_physical_devices()` | pyudev 枚举 `usb_device` → **`{devpath: (vid, pid, bus, device)}`**；bus/device 读不到时为 `None` |
+
+### 14.4 状态机 `Daemon`
+
+| 成员 | 职责 |
+|---|---|
+| `self.devices` | `devpath → {vid, pid, present, attached}`（事件/对账共享的状态表） |
+| `self.timers` | `(due, key, func)` 列表；`set_timer` 同 key 去重、`fire_timers` 到期执行且异常隔离 |
+| `self.reconcile_due` | 下次对账的单调时钟时间点 |
+| `handle_event(ev)` | 入口：校验 DEVTYPE / 解析 PRODUCT / hub 过滤 → 只分派 `add`/`remove`（§6.1） |
+| `on_add` | 置 present → IDLE/非白名单短路 → 调度 settle 定时器（§6.2） |
+| `attach_if_needed` | settle 到期执行：present + 物理存在 + VM 运行 + 配置可读 → 失效条目先清再挂 → attach |
+| `on_remove` | 未跟踪设备即时清理（查配置）→ 已知设备置 present=False 并调度去抖（§6.3） |
+| `maybe_detach` | 去抖到期执行：端口重现=重枚举跳过；VM 未知留给对账；真拔 → detach |
+| `reconcile` | 三动作：补 attach / 地址比对恢复失效条目 / 清僵尸；附内存卫生（§7） |
+| `run` | pyudev 检查 → monitor 初始化 → **启动即对账** → select 循环（排空事件 / 周期对账 / 定时器） |
+
+### 14.5 入口 `main`
+
+| 能力 | 说明 |
+|---|---|
+| `--reconcile-once` | 执行一次对账后退出（部署验证用） |
+| `--debug` | DEBUG 级别日志 |
+| `SIGHUP` | 立即触发一次对账（`systemctl kill -s HUP usb-passthrough`） |
+
+---
+
+## 15. 真实事件走查（状态机行为对照）
+
+> 用测试内嵌的真实捕获事件（`test_replay.py` 的 `EVENTS`）讲解状态机在每个关键时刻的行为。时间戳为捕获日志的相对秒。
+
+### 15.1 K6 键盘插拔（端口 5-2.1.4）
+
+| 时间 | 事件 | 状态机动作 |
+|---|---|---|
+| 5782.24 | `add 05ac:024f` | present=True，调度 settle（5783.24 到期） |
+| 5782.24 / 5782.31 | `change` / `bind` | 忽略（只认 add/remove） |
+| 5788.58 | `unbind` → `remove` | present=False，调度去抖（5789.58 到期） |
+| 5789.58 | 去抖到期 | 端口仍无设备 → detach（若 VM 运行）→ 键盘回宿主 |
+| 5808.30 | `add 05ac:024f` | 重新调度 settle → attach → Windows 重新识别 |
+
+### 15.2 8BitDo 手柄模式循环（端口 5-2.1.3，核心场景）
+
+| 时间 | 事件 | 状态机动作 |
+|---|---|---|
+| 6055.20 | `remove 2dc8:3106` | present=False，调度去抖 |
+| 6055.69 | `add 2dc8:3109`（IDLE） | `on_add` **清掉去抖定时器**；IDLE → ignored，不调度任何事 |
+| 6085.41 | `remove 3109` | 非白名单 → 直接返回（无去抖） |
+| 6085.83 | `add 2dc8:3106` | 调度 settle → attach（手柄回到 Windows） |
+| 6097.44 | `remove 3106` | 去抖调度 |
+| 6098.35 | `add 3109`（IDLE） | 清去抖；ignored |
+| …… | 循环 | **每次 3106 出现都重新直通，IDLE 永不直通，全程零 detach 抖动** |
+
+### 15.3 Razer 鼠标重枚举（端口 5-2.1.2）
+
+| 时间 | 事件 | 状态机动作 |
+|---|---|---|
+| 7202.59 | `unbind` → `remove 1532:0083` | 去抖调度（这是**真实拔除/断电**——Razer 开关切换不产生事件，见 §16.4） |
+| 7203.59 | 去抖到期 | 端口仍无设备 → detach（鼠标离开 VM） |
+| 7229.99 | `add 1532:0083` | settle → attach（鼠标回到 VM） |
+
+---
+
+## 16. 领域知识（接手必读）
+
+### 16.1 USB 枚举与重枚举
+
+- **插入 = 枚举**：分配 DEVNUM（单调递增、不立刻复用）→ 创建设备节点 → 绑定接口驱动；
+- **重枚举 = 同一物理端口的一对 `remove`+`add`**：无线设备模式切换、休眠唤醒、拔插都会触发；
+- 重枚举后 **DEVNUM 变化但 DEVPATH（端口拓扑）不变**——所以识别设备必须用 DEVPATH。
+
+### 16.2 uevent 属性
+
+- **内核 uevent 自带**：`ACTION`/`DEVPATH`/`SUBSYSTEM`/`DEVTYPE`/`PRODUCT`/`TYPE`/`BUSNUM`/`DEVNUM`——add 和 remove 事件都有；
+- **udev 规则后处理才有**：`ID_VENDOR_ID`/`ID_MODEL_ID`/`ID_SERIAL` 等——remove 时可能缺失；
+- 守护进程只用内核属性，所以**内核 socket（pyudev `from_netlink`）就够**，不需要等 udev 规则。
+
+### 16.3 libvirt hostdev 语义（本项目最关键的外部知识）
+
+- 按 vendor/product 匹配的 hostdev，libvirt 在 attach 时解析设备并把**解析地址写进 live XML 的 `<source>`**——这是对账地址比对（§7）能工作的前提；
+- 设备物理消失后，live XML 条目**不会自动移除** → 变成失效条目（stale entry）；QEMU 侧设备已死、guest 已丢设备；
+- libvirt **不会**在设备重枚举后自动恢复——这正是本项目存在的理由（virt-manager 持久直通也依赖同一机制，同样不会恢复）；
+- `managed='yes'`：libvirt 自动处理宿主驱动解绑/回绑；
+- `--live` 只动运行态；持久配置（virt-manager）在 VM 启动时生效——两者分工见 §9。
+
+### 16.4 三台设备的真实行为（从捕获日志总结）
+
+| 设备 | 行为 |
+|---|---|
+| Keychron K6（`05ac:024f`） | 切蓝牙 = **拔 USB 线**（真实 remove）；切回 = 插线（add）。无 serial，只能按 vid:pid 匹配 |
+| Razer Basilisk X（`1532:0083`） | 蓝牙↔2.4G 开关**不产生任何 uevent**（dongle 保持枚举）——切蓝牙后 dongle 留在 VM 里空闲，宿主走蓝牙 |
+| 8BitDo Ultimate | 激活 = `3106`（游戏模式，厂商自定义）；关机/未连 = `3109`（IDLE 空壳 HID）；两者切换 = 完整重枚举、DEVNUM 持续增长（实测 045→052→…）；serial 恒为 `E417D8FD31F9` |
+
+---
+
+## 17. 术语表
+
+| 术语 | 含义 |
+|---|---|
+| uevent | 内核设备事件（经 netlink 发出），udev 及用户态监听的原生事件 |
+| DEVNUM | 设备在总线上的编号（对应 `/dev/bus/usb/BUS/DEV`），重枚举会变 |
+| DEVPATH | 设备 sysfs 路径（端口拓扑，如 `/devices/.../usb5/5-2.1.3`），重枚举不变 |
+| PRODUCT | uevent 属性 `vid/pid/rev`，add/remove 都携带 |
+| hostdev | libvirt 的设备直通条目（XML 中的 `<hostdev>`） |
+| stale entry（失效条目） | VM 配置里设备已重枚举/消失但条目仍在的 hostdev |
+| settle | add 后、attach 前的等待期（等接口枚举完） |
+| 去抖（debounce） | remove 后、detach 前的等待期（区分真拔与重枚举） |
+| reconcile（对账） | 周期性"物理设备清单 vs VM 配置清单"对齐 |
+| IDLE | 8BitDo 接收器未连接手柄的状态（`2dc8:3109`），永不直通 |
+| `managed='yes'` | libvirt 自动管理宿主驱动解绑/回绑 |
+| 地址比对 | 对账用"XML 记录地址 vs 设备当前 bus/device"判断条目是否失效 |
