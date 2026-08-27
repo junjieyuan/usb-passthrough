@@ -14,7 +14,7 @@ subprocess, no fallback. Only kernel-level properties are used
 (PRODUCT / TYPE / DEVTYPE / DEVPATH), so the kernel socket is sufficient.
 Requires python3-pyudev; the daemon refuses to start without it.
 
-Design decisions (rationale in README.md):
+Design decisions (rationale in docs/DESIGN.md):
     * identity  = PRODUCT=vid/pid/rev (present on both add AND remove events)
                   + DEVPATH (stable port path; DEVNUM changes on every
                   re-enumeration, e.g. 8BitDo 3106<->3109, Razer 004->053)
@@ -40,9 +40,8 @@ import sys
 import tempfile
 import time
 
-# pyudev is the ONLY event source (no fallback). The import is guarded only
-# so the module can be imported for testing on machines without pyudev; the
-# daemon itself refuses to start when pyudev is missing.
+# pyudev is the ONLY event source (no fallback). Guarded import: tests can
+# load this module without pyudev; the daemon refuses to start without it.
 try:
     import pyudev  # noqa: F401
 except ImportError:
@@ -143,6 +142,8 @@ def _xml_tempfile(xml):
 
 
 def hostdev_xml(vid, pid):
+    # match by vendor/product only — deliberately NO <address>: a host-side
+    # address binds DEVNUM, which changes on every re-enumeration
     return (
         "<hostdev mode='subsystem' type='usb' managed='yes'>\n"
         "  <source>\n"
@@ -228,7 +229,6 @@ def detach_device(vid, pid):
 # ---------------------------------------------------------------------------
 
 def devpath_present(devpath):
-    """Whether the device port currently exists on the bus."""
     return os.path.isdir("/sys" + devpath)
 
 
@@ -477,9 +477,8 @@ class Daemon:
             log.info("reconcile: attaching %04x:%04x (%s)", vid, pid, devpath)
             if attach_device(vid, pid):
                 rec["attached"] = True
-                # a settle timer may still be pending for this enumeration; it
-                # would only re-run attach_if_needed and cause a needless
-                # detach+attach churn — cancel it
+                # cancel a still-pending settle timer for this enumeration
+                # (same churn avoidance as the stale-address branch above)
                 self.clear_timer("attach:" + devpath)
 
         # clean zombie entries: allowed hostdev in the VM config whose
@@ -514,6 +513,8 @@ class Daemon:
         fd = monitor.fileno()
         while True:
             try:
+                # 0.5s timeout wakes the loop for timers / reconcile even
+                # when no uevent arrives
                 ready, _, _ = select.select([fd], [], [], 0.5)
             except (OSError, ValueError):
                 break
@@ -567,6 +568,7 @@ def main():
     if "--reconcile-once" in sys.argv:
         daemon.reconcile()
         return 0
+    # SIGHUP: pull the reconcile deadline to now -> immediate reconcile
     signal.signal(signal.SIGHUP,
                   lambda s, f: setattr(daemon, "reconcile_due", time.monotonic()))
     try:

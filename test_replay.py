@@ -25,9 +25,9 @@ import importlib.util
 import os
 import sys
 
-# Pin configuration BEFORE loading the daemon module: the daemon reads these
-# from the environment at import time, and a shell that exports e.g.
-# USB_PT_ALLOWED (for the systemd unit) would otherwise change test behavior.
+# Pin configuration BEFORE loading the daemon module: it reads these from
+# the environment at import time, so any USB_PT_* exported in the shell
+# (e.g. for the systemd unit) would otherwise change test behavior.
 os.environ["USB_PT_VM"] = "testvm"
 os.environ["USB_PT_ALLOWED"] = "05ac:024f,1532:0083,2dc8:3106"
 os.environ["USB_PT_IDLE"] = "2dc8:3109"
