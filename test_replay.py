@@ -169,6 +169,37 @@ for name, ok, why in checks:
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {why}")
     failed = failed or not ok
 
+# --- stale-entry recovery check (the core virt-manager gap) ---------------
+# The VM's live config can still list a hostdev whose device physically
+# re-enumerated (libvirt never auto-recovers). On re-add the daemon must
+# clear the stale entry FIRST, then attach fresh. The main replay mocks
+# vm_attached_devices as empty, so this path is exercised explicitly here.
+STALE_DP = "/devices/pci0000:00/0000:00:08.1/0000:0d:00.4/usb5/5-2/5-2.1/5-2.1.3"
+saved_mocks = (d.vm_attached_devices, d.attach_device, d.detach_device)
+try:
+    d.vm_attached_devices = lambda: {(0x2DC8, 0x3106)}  # stale entry in VM config
+    stale_detached = []
+    stale_attached = []
+    d.detach_device = lambda vid, pid: stale_detached.append((vid, pid)) or True
+    d.attach_device = lambda vid, pid: stale_attached.append((vid, pid)) or True
+
+    s = d.Daemon()
+    fake_sysfs.clear()
+    fake_sysfs[STALE_DP] = True
+    fake.t = 20000.0
+    s.handle_event({"action": "add", "DEVTYPE": "usb_device",
+                    "devpath": STALE_DP, "PRODUCT": "2dc8/3106/114"})
+    fake.t += 2.0  # past the settle window
+    s.fire_timers()
+    ok = (stale_detached == [(0x2DC8, 0x3106)] and
+          stale_attached == [(0x2DC8, 0x3106)])
+    print(f"{'PASS' if ok else 'FAIL'}  stale-entry recovery: "
+          f"detach-then-attach on re-add "
+          f"(detached={stale_detached}, attached={stale_attached})")
+    failed = failed or not ok
+finally:
+    d.vm_attached_devices, d.attach_device, d.detach_device = saved_mocks
+
 print("attached:", [f"{v:04x}:{p:04x}" for v, p in attached_log])
 print("detached:", [f"{v:04x}:{p:04x}" for v, p in detached_log])
 sys.exit(1 if failed else 0)
