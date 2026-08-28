@@ -60,7 +60,7 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 |---|---|
 | `EVENTS` | 内嵌真实事件 `(时间戳, action, devpath, PRODUCT)`（含无线设备全部模式切换；来源为作者真机捕获，详见 AUTHOR_DEPLOYMENT.md） |
 | `SEED` | 模拟"守护进程启动前设备已在位且已直通"（否则首个事件会被当作 untracked） |
-| mocks | `vm_snapshot`/`scan_physical_devices`/`attach_device`/`detach_device`/`devpath_present`/`time` 全部替换为测试替身；`vm_snapshot` mock 为 `lambda: (running, attached)`（两维独立控制）；场景函数经 `save_mocks()`/`restore_mocks()` 打补丁并复位 |
+| mocks | `vm_snapshot`/`vm_snapshots`/`VM_NAMES`/`scan_physical_devices`/`attach_device`/`detach_device`/`devpath_present`/`time` 全部替换为测试替身；`vm_snapshot` mock 带 `name` 形参 `lambda name: (running, attached)`（两维独立控制）；单 VM 场景改 `vm_snapshot`（`vm_snapshots()` 会自动组合），多 VM 场景改 `vm_snapshots` + `VM_NAMES`；场景函数经 `save_mocks()`/`restore_mocks()` 打补丁并复位 |
 | `replay_main_flow()` | 回放 `EVENTS` 并断言主路径行为。回放循环每个事件：先 `fire_timers()`（触发到期定时器）→ 更新 fake sysfs → `handle_event()`。**顺序不能反**：去抖/settle 的判定依赖"定时器先于事件生效" |
 | `scenario_*()` | 定向场景函数（清单见 §5.2），各自返回 `[(断言名, 通过, 说明)]` |
 | `report()` | 汇总打印全部 `PASS/FAIL` 并决定退出码（有任一 FAIL 则 exit 1） |
@@ -81,6 +81,11 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 - `scenario_timer_same_key_dedupe`（同 key 定时器替换不叠加）
 - `scenario_reconcile_vm_not_running`（对账边界：VM 未运行时无动作）
 - `scenario_nonallowed_ignored`（非允许清单设备——如接收器的空壳状态——的 add 不产生任何定时器或动作）
+- `scenario_multi_vm_order` / `_first_running_wins` / `_reelect_on_stop`（多 VM 属主选举：第一台运行 VM 胜出；无 home 记忆时重选第一台运行；属主 VM 停止后重新选举）
+- `scenario_multi_vm_no_migration` / `_stale_reentry` / `_duplicate_sweep`（静态归属与跨 VM 清理：不迁移到更高优先级、重枚举仍回原 VM、清掉另一台 VM 的重复条目）
+- `scenario_multi_vm_unknown_defer`（更高优先级 VM 状态未知 → 整体推迟）
+- `scenario_multi_vm_dead_zombie`（物理已消失但多台 VM 均列有该设备 → 从所有 VM detach）
+- `scenario_env_vm_list`（`_parse_vms`：逗号分隔/去空白/单值向后兼容/空值 → 空列表）
 - `scenario_env_strict`（`_env_int`：合法/缺失值正常解析；坏值——含历史小数写法 `1.0`——经子进程验证**非零退出拒绝启动**，fast fail 不兜底）
 
 **注意**：对账类测试要先把 `d.pyudev` mock 成非 None（`reconcile()` 开头有 pyudev 守卫，测试环境没装 pyudev 会直接中止）。

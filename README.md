@@ -40,6 +40,9 @@ journalctl -u usb-passthrough -f
 ```ini
 Environment=USB_PT_VM=myvm
 Environment=USB_PT_ALLOWED=1234:5678
+
+# 多台虚拟机：逗号分隔、有序（顺序即优先级），设备直通给第一台运行中的 VM
+Environment=USB_PT_VM=ubuntu,windows
 ```
 
 然后 `sudo systemctl daemon-reload && sudo systemctl restart usb-passthrough`。
@@ -75,7 +78,7 @@ sudo dnf install python3-pyudev python3-libvirt   # Arch: sudo pacman -S python-
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `USB_PT_VM` | **无（必填）** | 目标虚拟机名 |
+| `USB_PT_VM` | **无（必填）** | 目标虚拟机名，可逗号分隔多台（**有序，顺序即直通优先级**）：设备按顺序直通给第一台运行中的 VM（一台设备同时只在一台 VM）。单台只写一个名字即可 |
 | `USB_PT_ALLOWED` | **无（必填）** | 允许直通的设备 `vid:pid,...`（至少一个）；设备的空壳/空闲状态（如某些无线接收器未连接时）绝不能进此清单 |
 | `USB_PT_SETTLE` | `1` | add 后等待秒数（整数） |
 | `USB_PT_DEBOUNCE` | `1` | remove 后去抖秒数（整数） |

@@ -294,7 +294,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 | 环境变量 | 默认 | 为什么是这个默认 |
 |---|---|---|
-| `USB_PT_VM` | **无（必填）** | 目标虚拟机名，启动日志会打印确认；缺失拒绝启动 |
+| `USB_PT_VM` | **无（必填）** | 目标虚拟机名，逗号分隔、**有序（顺序即直通优先级）**；设备按顺序直通给第一台运行中的 VM（一台设备同时只在一台 VM）；单台只写一个名字；缺失拒绝启动 |
 | `USB_PT_ALLOWED` | **无（必填）** | 允许直通清单 `vid:pid,...`，至少一个；缺失拒绝启动。设备的空壳/空闲状态绝不能进此清单 |
 | `USB_PT_SETTLE` | `1` | add 后等 1 秒让接口枚举完（见 6.2） |
 | `USB_PT_DEBOUNCE` | `1` | remove 后等 1 秒确认不是重枚举（见 6.3） |
@@ -316,7 +316,8 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 | 符号 | 作用 |
 |---|---|
 | `VidPid` / `BusDev` / `AttachedMap` | 类型别名：`(vid,pid)` / `(bus,device)` / `vid:pid → 记录地址` 的映射（地址缺失为 `None`） |
-| `VM_NAME` | 目标 VM 名（env `USB_PT_VM`，必填，无内置默认） |
+| `VM_NAMES` | 目标 VM 名**有序列表**（env `USB_PT_VM`，逗号分隔，顺序即优先级，必填，无内置默认） |
+| `_parse_vms(s)` | 解析 `USB_PT_VM` 逗号分隔 → 有序名字列表（去空白、丢空段，`None`→`[]`） |
 | `_env_int(name, default)` | 环境变量整数解析（所有数值配置共用）：缺失用默认值；**坏值（非整数）直接拒绝启动（fast fail：非零退出 + 明确报错），绝不兜底** |
 | `_parse_pairs(s)` | 解析 `vid:pid` 逗号列表 → 元组列表；坏项记警告跳过（不崩溃） |
 | `ALLOWED` | 允许直通清单（env `USB_PT_ALLOWED`，必填；空壳/空闲状态不得列入） |
@@ -328,11 +329,12 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 |---|---|
 | `_open(readonly)` | **短生命期连接**（§8.5）：现开现关，libvirtd 重启在下一次调用自愈；查询走 `openReadOnly`，attach/detach 走读写连接；带 keepalive 防阻塞；bindings 缺失/libvirtd 不可达 → `None`（= 状态未知） |
 | `_conn(readonly)` | contextmanager 包装 `_open()`：with 块结束担保 `close()`；连接开失败时 yield `None` |
-| `vm_snapshot()` | **单只读连接**返回 `(running, attached)`（§8.6）：`dom.state()[0]==VIR_DOMAIN_RUNNING` + `dom.XMLDesc(0)`（仅运行中读配置）；两维失败独立返回 `None`；非 running 打印 `VM ... not running (state=...)` |
+| `vm_snapshot(name)` | **单只读连接**返回单台 VM 的 `(running, attached)`（§8.6）：`dom.state()[0]==VIR_DOMAIN_RUNNING` + `dom.XMLDesc(0)`（仅运行中读配置）；两维失败独立返回 `None`；非 running 打印 `VM ... not running (state=...)`；**`VIR_ERR_NO_DOMAIN`（名字不存在）视为「确定未运行」返回 `(False,{})`**，不算未知 |
+| `VMSnapshot` / `vm_snapshots()` | `VMSnapshot` = `(name, running, attached)` dataclass；`vm_snapshots()` 按 `VM_NAMES` 顺序逐台 `vm_snapshot(name)` 合成全量快照（每台一个短只读连接，§8.6 单机不变量不变） |
 | `_parse_hostdev_map(xml)` | 正则解析 live XML 的 hostdev → **`{(vid,pid): (bus,device) 或 None}`**；地址从 `<source>` 里提取，是对账地址比对（§7）的数据来源；为什么不用 `virDomainListHostdevs` 类型化包装见 §8.2（python 绑定未暴露，实测决策记录） |
 | `hostdev_xml(vid,pid)` | 生成 vendor/product-only 的 hostdev XML（§8.1） |
-| `attach_device(vid,pid)` | `attachDeviceFlags(xml, VIR_DOMAIN_AFFECT_LIVE)`（§8.2）；重试 `ATTACH_RETRIES` 次、间隔 `ATTACH_RETRY_GAP`；成功返回 `True` |
-| `detach_device(vid,pid)` | `detachDeviceFlags(xml, VIR_DOMAIN_AFFECT_LIVE)`；单次、**容错**（设备已消失/条目已不在视为正常，记日志返回 `False`） |
+| `attach_device(vid,pid,name)` | 对 `name` 执行 `attachDeviceFlags(xml, VIR_DOMAIN_AFFECT_LIVE)`（§8.2）；重试 `ATTACH_RETRIES` 次、间隔 `ATTACH_RETRY_GAP`；成功返回 `True` |
+| `detach_device(vid,pid,name)` | 对 `name` 执行 `detachDeviceFlags(xml, VIR_DOMAIN_AFFECT_LIVE)`；单次、**容错**（设备已消失/条目已不在视为正常，记日志返回 `False`） |
 
 ### 14.3 sysfs 层
 
@@ -345,18 +347,20 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 | 成员 | 职责 |
 |---|---|
-| `DeviceState` | dataclass 记录 `{vid, pid, present, attached}`——每端口设备状态（事件/对账共享），字符串键 dict 的类型安全替代 |
+| `DeviceState` | dataclass 记录 `{vid, pid, present, home}`——每端口设备状态（事件/对账共享）；`home` = 设备当前归属的 VM 名（`None` 未直通），承载「静态归属」记忆 |
 | `self.devices` | `devpath → DeviceState`（事件/对账共享的状态表） |
 | `self.timers` | `(due, key, func)` 列表；`set_timer` 同 key 去重、`fire_timers` 到期执行且异常隔离；settle/去抖/对账三类统一（对账为自续期周期定时器，§6.6） |
 | `_reconcile_tick` | 一次对账（异常隔离）+ 自续期调度下一轮；也是 SIGHUP 手动触发的入口 |
 | `handle_event(ev)` | 入口：校验 DEVTYPE / 解析 PRODUCT / hub 过滤 → 只分派 `add`/`remove`（§6.1） |
 | `on_add` | 置 present → 非白名单短路 → 调度 settle 定时器（§6.2） |
-| `attach_if_needed` | settle 到期执行：present + 物理存在 + `vm_snapshot()` 运行 → 调 `_heal_attach`（附快照的 attached map，§8.6） |
-| `_heal_attach` | 事件/对账共享的「失效判定 → 先清再挂 → 清 settle 定时器」：事件路径（无地址）有残留条目即失效；对账路径按地址比对，记录地址缺失时保守视为健康（§6.4/§7）；attached map 由调用方传入复用 |
-| `_detach_if_listed` | 「VM 配置里还列着该设备就 detach」的共享助手（未跟踪设备的 remove 即时清理与 `maybe_detach` 兜底共用；接收调用方的 attached map） |
-| `on_remove` | 未跟踪设备即时清理（`vm_snapshot()` 查配置）→ 已知设备置 present=False 并调度去抖（§6.3） |
-| `maybe_detach` | 去抖到期执行：端口重现=重枚举跳过；VM 未知留给对账；真拔 → detach |
-| `reconcile` | 三动作：补 attach（经 `_heal_attach`）/ 清僵尸；附内存卫生（§7） |
+| `attach_if_needed` | settle 到期执行：present + 物理存在 + `vm_snapshots()` 选属主 → 调 `_heal_attach`（§8.6） |
+| `_entry_stale` | 失效判定：事件路径（bus=None）有条目即失效；对账路径按地址比对，记录地址缺失时保守视为健康 |
+| `_pick_target` | 属主选择：任一 VM `running=None` → `unknown`（保守推迟）；无运行 VM → `none`；`rec.home` 仍运行则驻留不做迁移；否则取第一台运行 VM（顺序即优先级，停止后重新选举，§18） |
+| `_heal_attach` | 事件/对账共享的「跨 VM 先清再挂 → 清 settle 定时器」：清除所有运行 VM 里的 stale/duplicate 条目，再 attach 到属主；目标已健康则幂等跳过（§6.4/§7/§18）；快照由调用方传入复用 |
+| `_detach_if_listed` | 「所有运行 VM 里还列着该设备就 detach」的助手（`on_remove` 对未跟踪设备的即时清理用；接收调用方的全量快照） |
+| `on_remove` | 未跟踪设备即时清理（`vm_snapshots()` 查配置）→ 已知设备置 present=False 并调度去抖（§6.3） |
+| `maybe_detach` | 去抖到期执行：端口重现=重枚举跳过；真拔 → 从 `home` + 所有列出它的运行 VM detach |
+| `reconcile` | 三动作：补 attach（经 `_heal_attach`）/ 清僵尸（跨所有运行 VM）；附内存卫生（§7/§18） |
 | `run` | pyudev + libvirt 检查（缺失拒绝启动）→ monitor 初始化 → **启动即对账**（`_reconcile_tick`）→ select 循环（排空事件 / 定时器） |
 
 ### 14.5 入口 `main`
@@ -416,3 +420,20 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 | IDLE / 空闲状态 | 无线接收器未连接设备时的空壳状态，不在允许清单，守护进程不做任何动作 |
 | `managed='yes'` | libvirt 自动管理宿主驱动解绑/回绑 |
 | 地址比对 | 对账用"XML 记录地址 vs 设备当前 bus/device"判断条目是否失效 |
+| 属主/归属（home） | 设备当前直通到的 VM；静态归属——一旦直通后驻留该 VM，直至其关闭（§18） |
+
+---
+
+## 18. 多 VM 支持（属主选择）
+
+**做什么**：`USB_PT_VM` 支持逗号分隔的**有序 VM 列表**（顺序即直通优先级）。设备按顺序直通给**第一台运行中**的 VM；一台设备同时只直通给一台 VM。
+
+**为什么不迁移（静态归属）**：设备一旦正常直通到某台运行中的 VM，就固定留在那台（`DeviceState.home` 记忆归属），重枚举也回到它——即便更高优先级的 VM 之后也运行起来。这与本项目核心的「不放大抖动」原则一致：迁移意味着无谓的 detach+attach、客户机掉线重连。只有当归属 VM 关闭后，设备才按顺序转投下一台运行中的 VM。
+
+**为什么状态未知就整体推迟**：因为「一台设备只在一台 VM」，若某台更高优先级 VM 的运行态读不到（`running=None`），无法排除设备已被其占用，此时直通给更低优先级 VM 有**重复直通**风险。故 `_pick_target` 对任一 `running=None` 直接返回 `unknown`，attach 与对账都推迟到下一轮（沿用 §3 原则 1）。注意：VM **名不存在**不算「未知」——`vm_snapshot` 把 `VIR_ERR_NO_DOMAIN` 视为「确定未运行」（返回 `(False,{})`），这样写错/漏建一个 VM 名只是让那台不参与，不会拖垮其它配置正确的 VM。
+
+**选举规则**：`_pick_target` 从第一个 VM 开始顺序扫描，选定**第一台运行中**的 VM 作为属主；一旦选定就写入 `rec.home` 保持不变——重枚举、对账、更高优先级 VM 后来运行都不会改变归属。只有当该 VM **停止运行**后，`rec.home` 不再命中运行列表，才**重新从头选举**（取新的第一台运行 VM）。因此守护进程重启后（`home` 是内存态、随进程丢失）同样按「第一台运行 VM」重新归属。
+
+**跨 VM 的「先清再挂」**：设备重枚举或配置调整后，stale/duplicate 条目可能同时残留在多台 VM。`_heal_attach` 在 attach 前遍历**所有运行 VM**，凡列出该 `(vid,pid)` 且判定失效（或属重复条目）的 VM 都先 `detach`，再向属主 `attach`，保证「一台设备至多出现在一台运行 VM」。
+
+**对账不变量的推广**：`reconcile` 从「单 VM 求差集」推广为「对所有 VM 求差集」——补 attach（经 `_heal_attach`）、清僵尸（每个运行 VM 里、物理已消失且白名单内的条目都 detach）。单 VM（列表长度为 1）时路径退化回改动前的行为，完全向后兼容。

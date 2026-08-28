@@ -86,9 +86,16 @@ log = logging.getLogger("usb-pt")
 # Configuration (all overridable via environment)
 # ---------------------------------------------------------------------------
 
-# Required: the target VM name and the allowlist come exclusively from the
-# environment. The daemon refuses to start without them (see main()).
-VM_NAME = os.environ.get("USB_PT_VM")
+# Required: the ordered target VM name list and the allowlist come
+# exclusively from the environment. The daemon refuses to start without
+# them (see main()). USB_PT_VM is comma-separated; its order is the
+# passthrough priority (a device goes to the first running VM). A single
+# name still works (list of length one), so existing deployments are intact.
+def _parse_vms(raw: str | None) -> list[str]:
+    return [s.strip() for s in (raw or "").split(",") if s.strip()]
+
+
+VM_NAMES = _parse_vms(os.environ.get("USB_PT_VM"))
 
 
 def _env_int(name: str, default: int) -> int:
@@ -179,8 +186,8 @@ def _conn(readonly: bool = False):
             c.close()
 
 
-def vm_snapshot() -> tuple[bool | None, AttachedMap | None]:
-    """One read-only connection: (VM running?, USB hostdevs in live config).
+def vm_snapshot(name: str) -> tuple[bool | None, AttachedMap | None]:
+    """One read-only connection for one VM: (running?, USB hostdevs in config).
 
     running is True/False/None — None means the state could not be
     determined and must NEVER be treated as "not running": skip the action,
@@ -198,14 +205,20 @@ def vm_snapshot() -> tuple[bool | None, AttachedMap | None]:
         if conn is None:
             return None, None
         try:
-            dom = conn.lookupByName(VM_NAME)
+            dom = conn.lookupByName(name)
             state = dom.state()[0]
         except libvirt.libvirtError as e:
-            log.error("cannot read state of VM %s: %s", VM_NAME, e)
+            if e.get_error_code() == libvirt.VIR_ERR_NO_DOMAIN:
+                # a mistyped / not-yet-defined VM name is definitively "not
+                # running", NOT "unknown": treat it as off so it merely
+                # doesn't participate instead of blocking every other VM
+                log.info("VM %s not defined (not running)", name)
+                return False, {}
+            log.error("cannot read state of VM %s: %s", name, e)
             return None, None
         running = state == libvirt.VIR_DOMAIN_RUNNING
         if not running:
-            log.info("VM %s not running (state=%s)", VM_NAME, state)
+            log.info("VM %s not running (state=%s)", name, state)
             # config stays unread: it is irrelevant while the VM is off and
             # no caller consumes the map in that case
             return running, {}
@@ -214,11 +227,29 @@ def vm_snapshot() -> tuple[bool | None, AttachedMap | None]:
             # `virsh dumpxml` (the resolved <address> lands in <source>)
             xml = dom.XMLDesc(0)
         except libvirt.libvirtError as e:
-            log.error("cannot read config of VM %s: %s", VM_NAME, e)
+            log.error("cannot read config of VM %s: %s", name, e)
             return running, None
         attached = _parse_hostdev_map(xml)
-    log.debug("vm snapshot: running=%r, attached=%r", running, attached)
+    log.debug("vm snapshot %s: running=%r, attached=%r", name, running, attached)
     return running, attached
+
+
+@dataclass
+class VMSnapshot:
+    """One VM's state snapshot: name + running + attached hostdev map."""
+    name: str
+    running: bool | None
+    attached: AttachedMap | None
+
+
+def vm_snapshots() -> list[VMSnapshot]:
+    """Ordered snapshot of every configured VM (one short connection each).
+
+    Order equals USB_PT_VM order = passthrough priority. Running/attached
+    retain the same None semantics as vm_snapshot(): running=None is
+    "unknown" (never "off"), attached=None is "config unreadable".
+    """
+    return [VMSnapshot(n, *vm_snapshot(n)) for n in VM_NAMES]
 
 
 def _parse_hostdev_map(xml: str) -> AttachedMap:
@@ -262,8 +293,8 @@ def hostdev_xml(vid: int, pid: int) -> str:
     )
 
 
-def attach_device(vid: int, pid: int) -> bool:
-    """Live-attach; retries internally. Returns True on success.
+def attach_device(vid: int, pid: int, name: str) -> bool:
+    """Live-attach to `name`; retries internally. Returns True on success.
 
     attachDeviceFlags(xml, VIR_DOMAIN_AFFECT_LIVE) is the exact API that
     `virsh attach-device --live` drives; the XML string goes in directly
@@ -276,9 +307,9 @@ def attach_device(vid: int, pid: int) -> bool:
                 reason = "libvirt unavailable"
             else:
                 try:
-                    conn.lookupByName(VM_NAME).attachDeviceFlags(
+                    conn.lookupByName(name).attachDeviceFlags(
                         xml, libvirt.VIR_DOMAIN_AFFECT_LIVE)
-                    log.info("attached %04x:%04x to %s", vid, pid, VM_NAME)
+                    log.info("attached %04x:%04x to %s", vid, pid, name)
                     return True
                 except libvirt.libvirtError as e:
                     reason = str(e)
@@ -289,18 +320,18 @@ def attach_device(vid: int, pid: int) -> bool:
     return False
 
 
-def detach_device(vid: int, pid: int) -> bool:
-    """Live-detach; tolerant when the device / entry is already gone."""
+def detach_device(vid: int, pid: int, name: str) -> bool:
+    """Live-detach from `name`; tolerant when the device/entry is gone."""
     with _conn() as conn:
         if conn is None:
             return False
         try:
-            conn.lookupByName(VM_NAME).detachDeviceFlags(
+            conn.lookupByName(name).detachDeviceFlags(
                 hostdev_xml(vid, pid), libvirt.VIR_DOMAIN_AFFECT_LIVE)
         except libvirt.libvirtError as e:
             log.info("detach %04x:%04x tolerated: %s", vid, pid, e)
             return False
-    log.info("detached %04x:%04x from %s", vid, pid, VM_NAME)
+    log.info("detached %04x:%04x from %s", vid, pid, name)
     return True
 
 
@@ -346,7 +377,11 @@ class DeviceState:
     vid: int
     pid: int
     present: bool = False
-    attached: bool = False
+    # VM this device is currently attached to (None = not attached). Seeded
+    # with the VM once attached; on re-enumeration we prefer to re-attach to
+    # this same home (static assignment) instead of migrating to a
+    # higher-priority VM.
+    home: str | None = None
 
 
 # timer keys (settle/debounce keys carry the devpath as suffix)
@@ -448,64 +483,117 @@ class Daemon:
         if not devpath_present(devpath):
             log.info("%s gone during settle, skipping attach", devpath)
             return
-        running, attached = vm_snapshot()
-        if running is None:
+        snaps = vm_snapshots()
+        decision, _ = self._pick_target(snaps, rec)
+        if decision == "unknown":
             log.warning("VM state unknown, skipping attach of %s", devpath)
             return
-        if not running:
-            log.info("VM %s not running, not attaching %s", VM_NAME, devpath)
+        if decision == "none":
+            log.info("no VM running, not attaching %s", devpath)
             return
-        self._heal_attach(rec, devpath, attached=attached)
+        self._heal_attach(rec, devpath, snaps=snaps)
+
+    def _entry_stale(self, xml_addr: BusDev | None, bus: int | None,
+                     dev: int | None) -> bool:
+        """Is a recorded hostdev address stale for the device's enumeration?
+
+        Event path (bus=None): any existing entry is stale — the add event
+        itself proves a fresh enumeration. Reconcile path (bus/dev known):
+        stale only when the recorded address differs; a missing recorded
+        address is conservatively treated as healthy.
+        """
+        if bus is None:
+            return True
+        if xml_addr is None:
+            return False
+        return xml_addr != (bus, dev)
+
+    def _pick_target(self, snaps: list[VMSnapshot],
+                     rec: DeviceState) -> tuple[str, str | None]:
+        """(decision, target): which VM should own this device next.
+
+        decision: "unknown" (some VM state unreadable → defer, never risk a
+        double passthrough), "none" (no VM running), "attach" (target chosen).
+        Selection rule: scan VMs in config order, the first running VM wins;
+        once a VM is chosen it is sticky (rec.home) and never migrated while
+        it keeps running. The order of USB_PT_VM is the passthrough priority.
+        """
+        if any(vm.running is None for vm in snaps):
+            return "unknown", None
+        running = [vm for vm in snaps if vm.running]
+        if not running:
+            return "none", None
+        if rec.home and any(vm.name == rec.home for vm in running):
+            return "attach", rec.home
+        return "attach", running[0].name
 
     def _heal_attach(self, rec: DeviceState, devpath: str,
                      bus: int | None = None, dev: int | None = None,
-                     attached: AttachedMap | None = None) -> None:
-        """Attach a physically present device, clearing a stale hostdev first.
+                     snaps: list[VMSnapshot] | None = None) -> None:
+        """Attach a physically present device to its owner VM, clearing any
+        stale/duplicate hostdev entries first.
 
-        Shared by the event path (bus/dev unknown: any entry already in the
-        VM config counts as stale — the add event itself proves a fresh
-        enumeration) and the reconcile path (bus/dev known: stale only when
-        the entry's recorded address no longer matches the device).
-        attached is the caller's fresh vm_snapshot() map — None means the
-        config is unreadable, so skip. Reconcile shares its pass-wide read
-        so the config is not re-fetched per device.
+        Shared by the event path and the reconcile path (see _entry_stale
+        for the two staleness rules). `snaps` is the caller's fresh
+        vm_snapshots() pass-wide read — shared so the config is not
+        re-fetched per device.
+
+        Multi-VM invariant: one device lives in at most one VM. Stale or
+        duplicate entries are swept from every running VM first; then the
+        device is attached to its owner unless the owner already holds it
+        healthy (static: home if still running, else first running VM).
         """
-        if attached is None:
-            log.warning("cannot read VM config, skipping attach of %s", devpath)
+        if snaps is None:
+            snaps = vm_snapshots()
+        decision, target = self._pick_target(snaps, rec)
+        if decision != "attach":
+            log.info("not attaching %04x:%04x on %s (decision=%s)",
+                     rec.vid, rec.pid, devpath, decision)
             return
         key = (rec.vid, rec.pid)
-        if key in attached:
-            xml_addr = attached[key]
-            if bus is None:
-                stale = True
-            elif xml_addr is None:
-                # recorded address absent: conservatively treat as healthy
-                stale = False
+        target_snap = next(vm for vm in snaps if vm.name == target)
+        if target_snap.attached is None:
+            # can't compare against a config we can't read: skip, reconcile retries
+            log.warning("cannot read config of VM %s, skipping attach of %s",
+                        target, devpath)
+            return
+
+        # sweep the owner's stale entry + any duplicate entry in other
+        # running VMs, so the device ends up in at most one VM
+        cleared_stale = False
+        for vm in snaps:
+            if not vm.running:
+                continue
+            vm_map = vm.attached or {}
+            if key not in vm_map:
+                continue
+            if vm.name == target:
+                if not self._entry_stale(vm_map[key], bus, dev):
+                    continue  # healthy home entry: keep it
+                if bus is None:
+                    log.info("stale hostdev %04x:%04x, detaching first",
+                             rec.vid, rec.pid)
+                else:
+                    # entry resolved at an earlier enumeration; the guest
+                    # already lost it — clear then re-attach fresh
+                    log.info("reconcile: hostdev %04x:%04x resolved at %s but "
+                             "device now at %s — stale entry, re-attaching",
+                             rec.vid, rec.pid, vm_map[key], (bus, dev))
             else:
-                stale = xml_addr != (bus, dev)
-            if not stale:
-                rec.attached = True
-                return
-            if bus is None:
-                log.info("stale hostdev %04x:%04x, detaching first",
-                         rec.vid, rec.pid)
-            else:
-                # the VM entry was resolved at an earlier enumeration and
-                # the guest already lost the device — clear the stale
-                # entry, then attach fresh
-                log.info("reconcile: hostdev %04x:%04x resolved at %s but "
-                         "device now at %s — stale entry, re-attaching",
-                         rec.vid, rec.pid, xml_addr, (bus, dev))
-            detach_device(rec.vid, rec.pid)
+                log.info("duplicate hostdev %04x:%04x in %s, detaching",
+                         rec.vid, rec.pid, vm.name)
+            detach_device(rec.vid, rec.pid, vm.name)
             cleared_stale = True
-        else:
-            if bus is not None:
-                log.info("reconcile: attaching %04x:%04x (%s)",
-                         rec.vid, rec.pid, devpath)
-            cleared_stale = False
-        rec.attached = False
-        if attach_device(rec.vid, rec.pid):
-            rec.attached = True
+
+        # owner already holds it healthy (nothing swept for it) -> no attach
+        if key in target_snap.attached and not self._entry_stale(
+                target_snap.attached[key], bus, dev):
+            rec.home = target
+            return
+
+        rec.home = None
+        if attach_device(rec.vid, rec.pid, target):
+            rec.home = target
             # cancel a settle timer that may still be pending for this
             # enumeration; it would otherwise re-run attach_if_needed and
             # cause a needless detach+attach churn
@@ -515,11 +603,12 @@ class Daemon:
             self.clear_timer(TK_ATTACH + devpath)
 
     def _detach_if_listed(self, vid: int, pid: int,
-                          attached: AttachedMap | None) -> None:
-        """Detach a hostdev the config still lists (idempotent, tolerant).
-        attached is the caller's vm_snapshot() config map."""
-        if attached and (vid, pid) in attached:
-            detach_device(vid, pid)
+                          snaps: list[VMSnapshot]) -> None:
+        """Detach a hostdev every running VM still lists (idempotent,
+        tolerant). `snaps` is the caller's vm_snapshots() read."""
+        for vm in snaps:
+            if vm.running and vm.attached and (vid, pid) in vm.attached:
+                detach_device(vid, pid, vm.name)
 
     def on_remove(self, devpath: str, vid: int, pid: int) -> None:
         rec = self.devices.get(devpath)
@@ -529,9 +618,7 @@ class Daemon:
             if is_allowed(vid, pid):
                 log.info("remove of untracked allowed device %04x:%04x on %s",
                          vid, pid, devpath)
-                running, attached = vm_snapshot()
-                if running:
-                    self._detach_if_listed(vid, pid, attached)
+                self._detach_if_listed(vid, pid, vm_snapshots())
             return
         rec.present = False
         if not is_allowed(rec.vid, rec.pid):
@@ -550,40 +637,44 @@ class Daemon:
         rec = self.devices.get(devpath)
         if not rec:
             return
-        running, attached = vm_snapshot()
-        if running is None:
-            log.info("VM state unknown, leaving %s for reconcile", devpath)
-            rec.present = False
-            return
-        if running:
-            if rec.attached:
-                detach_device(rec.vid, rec.pid)
-                rec.attached = False
-            else:
-                self._detach_if_listed(rec.vid, rec.pid, attached)
+        # detach from the known home (if any) plus every running VM that
+        # still lists this device (catches stale/duplicate entries). An
+        # unknown/unreadable VM's entries are left for the next reconcile.
+        homes = set()
+        if rec.home:
+            homes.add(rec.home)
+        for vm in vm_snapshots():
+            if vm.running and vm.attached and (rec.vid, rec.pid) in vm.attached:
+                homes.add(vm.name)
+        for name in homes:
+            detach_device(rec.vid, rec.pid, name)
+        rec.home = None
         rec.present = False
 
     # ---- reconciliation -------------------------------------------------
 
     def reconcile(self) -> None:
-        """Diff physical devices vs VM config; heal attach/detach state.
+        """Diff physical devices vs all VMs' config; heal attach/detach state.
 
-        Covers: devices already present when the VM started, service
-        restarts, host suspend/resume, missed events, zombie hostdevs.
+        Covers: devices already present when a VM started, service restarts,
+        host suspend/resume, missed events, zombie hostdevs. One device is
+        kept in at most one running VM, owned by the first running VM in
+        config order (static: an existing healthy attachment is not moved).
         """
         log.info("reconcile start")
         if pyudev is None:
             log.error("pyudev unavailable, reconcile aborted")
             return
-        running, attached = vm_snapshot()
-        if running is None:
-            log.warning("cannot determine VM state, reconcile aborted")
+        snaps = vm_snapshots()
+        if any(vm.running is None for vm in snaps):
+            log.warning("cannot determine state of all VMs, reconcile aborted")
             return
-        if not running:
-            attached = {}  # config irrelevant while the VM is off
-        elif attached is None:
-            log.warning("cannot read VM config, reconcile aborted")
-            return
+        running_vms = [vm for vm in snaps if vm.running]
+        for vm in running_vms:
+            if vm.attached is None:
+                log.warning("cannot read config of VM %s, reconcile aborted",
+                            vm.name)
+                return
         physical = scan_physical_devices()
 
         for devpath, (vid, pid, _bus, _dev) in physical.items():
@@ -601,34 +692,35 @@ class Daemon:
                 if not is_allowed(rec.vid, rec.pid):
                     del self.devices[devpath]
 
-        if not running:
+        if not running_vms:
             for rec in self.devices.values():
-                rec.attached = False
-            log.info("VM not running, nothing to do")
+                rec.home = None
+            log.info("no VM running, nothing to do")
             return
 
-        # attach physically-present allowed devices that aren't in the VM
-        # (scan_physical_devices() already filters to the allowlist); the
-        # pass-wide config read is shared, no per-device re-fetch
+        # attach physically-present allowed devices that aren't already
+        # healthy in their owner (scan_physical_devices() already filters to
+        # the allowlist); the pass-wide read is shared, no per-device refetch
         for devpath, (vid, pid, bus, dev) in physical.items():
             rec = self.devices[devpath]
-            self._heal_attach(rec, devpath, bus, dev, attached)
+            self._heal_attach(rec, devpath, bus, dev, snaps)
 
-        # clean zombie entries: allowed hostdev in the VM config whose
+        # clean zombie entries across every running VM: allowed hostdev whose
         # physical device is not present anywhere
         present_ids = {(vid, pid) for (vid, pid, _b, _d) in physical.values()}
-        for (vid, pid) in attached:
-            if is_allowed(vid, pid) and (vid, pid) not in present_ids:
-                log.info("reconcile: stale hostdev %04x:%04x, detaching",
-                         vid, pid)
-                detach_device(vid, pid)
+        for vm in running_vms:
+            for (vid, pid) in vm.attached:
+                if is_allowed(vid, pid) and (vid, pid) not in present_ids:
+                    log.info("reconcile: stale hostdev %04x:%04x in %s, "
+                             "detaching", vid, pid, vm.name)
+                    detach_device(vid, pid, vm.name)
         log.info("reconcile done")
 
     # ---- main loop ------------------------------------------------------
 
     def run(self) -> None:
         log.info("starting USB passthrough daemon (VM=%s, allowed=%s)",
-                 VM_NAME, ", ".join("%04x:%04x" % p for p in ALLOWED))
+                 ",".join(VM_NAMES), ", ".join("%04x:%04x" % p for p in ALLOWED))
         if pyudev is None:
             log.error("python3-pyudev is required; install it "
                       "(e.g. sudo rpm-ostree install python3-pyudev) and "
@@ -686,7 +778,7 @@ def main() -> int:
     if "--debug" in sys.argv:
         logging.getLogger().setLevel(logging.DEBUG)
     missing = []
-    if not VM_NAME:
+    if not VM_NAMES:
         missing.append("USB_PT_VM")
     if not ALLOWED:
         missing.append("USB_PT_ALLOWED")

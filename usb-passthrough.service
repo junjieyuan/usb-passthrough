@@ -8,6 +8,9 @@ Wants=libvirtd.service
 Type=simple
 ExecStart=/usr/local/sbin/usb-passthrough-daemon.py
 # REQUIRED — uncomment and set; example values shown are the author's.
+# USB_PT_VM is a comma-separated, ORDERED list of VM names: a device is
+# passed to the first running VM in order (a device lives in only one VM).
+# A single VM name still works.
 # Environment=USB_PT_VM=windows
 # Environment=USB_PT_ALLOWED=05ac:024f,1532:0083,2dc8:3106
 # Note: "idle"/empty receiver states (dongle present, device off) stay
