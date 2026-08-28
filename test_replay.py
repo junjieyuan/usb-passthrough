@@ -59,9 +59,9 @@ attached_log = []   # [(vid, pid), ...] in order
 detached_log = []   # [(vid, pid), ...] in order
 fake_sysfs = {}     # devpath -> present?
 
-d.vm_snapshot = lambda: (True, {})
-d.attach_device = lambda vid, pid: attached_log.append((vid, pid)) or True
-d.detach_device = lambda vid, pid: detached_log.append((vid, pid)) or True
+d.vm_snapshot = lambda name: (True, {})
+d.attach_device = lambda vid, pid, name: attached_log.append((vid, pid)) or True
+d.detach_device = lambda vid, pid, name: detached_log.append((vid, pid)) or True
 
 
 def fake_present(devpath):
@@ -72,12 +72,12 @@ d.devpath_present = fake_present
 
 
 def save_mocks():
-    return (d.vm_snapshot, d.attach_device,
+    return (d.vm_snapshot, d.vm_snapshots, d.VM_NAMES, d.attach_device,
             d.detach_device, d.scan_physical_devices, d.pyudev)
 
 
 def restore_mocks(saved):
-    (d.vm_snapshot, d.attach_device,
+    (d.vm_snapshot, d.vm_snapshots, d.VM_NAMES, d.attach_device,
      d.detach_device, d.scan_physical_devices, d.pyudev) = saved
 
 
@@ -142,7 +142,7 @@ def replay_main_flow():
     daemon = d.Daemon()
     for devpath, (vid, pid) in SEED.items():
         daemon.devices[devpath] = d.DeviceState(vid, pid,
-                                                present=True, attached=True)
+                                                present=True, home="testvm")
         fake_sysfs[devpath] = True
 
     for ts, action, devpath, product in EVENTS:
@@ -200,11 +200,11 @@ def scenario_stale_entry_recovery():
     results = []
     saved = save_mocks()
     try:
-        d.vm_snapshot = lambda: (True, {(0x2DC8, 0x3106): None})  # stale entry in VM config (no recorded address)
+        d.vm_snapshot = lambda name: (True, {(0x2DC8, 0x3106): None})  # stale entry in VM config (no recorded address)
         stale_detached = []
         stale_attached = []
-        d.detach_device = lambda vid, pid: stale_detached.append((vid, pid)) or True
-        d.attach_device = lambda vid, pid: stale_attached.append((vid, pid)) or True
+        d.detach_device = lambda vid, pid, name: stale_detached.append((vid, pid)) or True
+        d.attach_device = lambda vid, pid, name: stale_attached.append((vid, pid)) or True
 
         s = d.Daemon()
         fake_sysfs.clear()
@@ -235,12 +235,12 @@ def scenario_reconcile_stale_address():
     saved = save_mocks()
     try:
         d.pyudev = object()  # satisfy reconcile()'s pyudev-required guard
-        d.vm_snapshot = lambda: (True, {(0x2DC8, 0x3106): (5, 47)})  # resolved at old enumeration
+        d.vm_snapshot = lambda name: (True, {(0x2DC8, 0x3106): (5, 47)})  # resolved at old enumeration
         d.scan_physical_devices = lambda: {REC_DP: (0x2DC8, 0x3106, 5, 48)}  # re-enumerated
         rec_detached = []
         rec_attached = []
-        d.detach_device = lambda vid, pid: rec_detached.append((vid, pid)) or True
-        d.attach_device = lambda vid, pid: rec_attached.append((vid, pid)) or True
+        d.detach_device = lambda vid, pid, name: rec_detached.append((vid, pid)) or True
+        d.attach_device = lambda vid, pid, name: rec_attached.append((vid, pid)) or True
 
         r = d.Daemon()
         r.reconcile()
@@ -251,7 +251,7 @@ def scenario_reconcile_stale_address():
                         f"(detached={rec_detached}, attached={rec_attached})"))
 
         # healthy case: recorded address matches the current device -> no churn
-        d.vm_snapshot = lambda: (True, {(0x2DC8, 0x3106): (5, 48)})
+        d.vm_snapshot = lambda name: (True, {(0x2DC8, 0x3106): (5, 48)})
         rec_detached.clear()
         rec_attached.clear()
         r2 = d.Daemon()
@@ -261,7 +261,7 @@ def scenario_reconcile_stale_address():
                         "no detach/attach churn"))
 
         # VM config unreadable -> reconcile aborts cleanly instead of crashing
-        d.vm_snapshot = lambda: (True, None)
+        d.vm_snapshot = lambda name: (True, None)
         d.scan_physical_devices = lambda: {REC_DP: (0x2DC8, 0x3106, 5, 48)}
         rec_detached.clear()
         rec_attached.clear()
@@ -322,8 +322,8 @@ def scenario_untracked_remove_listed():
     saved = save_mocks()
     det = []
     try:
-        d.vm_snapshot = lambda: (True, {(0x1532, 0x0083): (5, 47)})
-        d.detach_device = lambda vid, pid: det.append((vid, pid)) or True
+        d.vm_snapshot = lambda name: (True, {(0x1532, 0x0083): (5, 47)})
+        d.detach_device = lambda vid, pid, name: det.append((vid, pid)) or True
         s = d.Daemon()
         s.handle_event({"action": "remove", "DEVTYPE": "usb_device",
                         "devpath": "/devices/unknown", "PRODUCT": "1532/83/200"})
@@ -331,7 +331,7 @@ def scenario_untracked_remove_listed():
                         "remove of an untracked allowed device still listed "
                         "in the VM config should detach"))
         det.clear()
-        d.vm_snapshot = lambda: (False, {})
+        d.vm_snapshot = lambda name: (False, {})
         s2 = d.Daemon()
         s2.handle_event({"action": "remove", "DEVTYPE": "usb_device",
                          "devpath": "/devices/unknown", "PRODUCT": "1532/83/200"})
@@ -350,8 +350,8 @@ def scenario_attach_vm_unknown_skip():
     att = []
     DP = "/devices/unk"
     try:
-        d.vm_snapshot = lambda: (None, None)
-        d.attach_device = lambda vid, pid: att.append((vid, pid)) or True
+        d.vm_snapshot = lambda name: (None, None)
+        d.attach_device = lambda vid, pid, name: att.append((vid, pid)) or True
         fake_sysfs[DP] = True
         s = d.Daemon()
         s.handle_event({"action": "add", "DEVTYPE": "usb_device", "devpath": DP,
@@ -375,8 +375,8 @@ def scenario_attach_exhausts_retries():
     saved = save_mocks()
     DP = "/devices/retry"
     try:
-        d.vm_snapshot = lambda: (True, {})
-        d.attach_device = lambda vid, pid: False
+        d.vm_snapshot = lambda name: (True, {})
+        d.attach_device = lambda vid, pid, name: False
         fake_sysfs[DP] = True
         s = d.Daemon()
         s.handle_event({"action": "add", "DEVTYPE": "usb_device", "devpath": DP,
@@ -385,7 +385,7 @@ def scenario_attach_exhausts_retries():
         s.fire_timers()
         rec = s.devices[DP]
         results.append(("attach failure leaves unattached",
-                        rec is not None and rec.attached is False,
+                        rec is not None and rec.home is None,
                         "failed attach must not flip the record to attached"))
     finally:
         fake_sysfs.pop(DP, None)
@@ -412,15 +412,15 @@ def scenario_reconcile_vm_not_running():
     DP = "/devices/rc"
     try:
         d.pyudev = object()
-        d.vm_snapshot = lambda: (False, {})
+        d.vm_snapshot = lambda name: (False, {})
         d.scan_physical_devices = lambda: {DP: (0x2DC8, 0x3106, 5, 48)}
         att, det = [], []
-        d.attach_device = lambda vid, pid: att.append((vid, pid)) or True
-        d.detach_device = lambda vid, pid: det.append((vid, pid)) or True
+        d.attach_device = lambda vid, pid, name: att.append((vid, pid)) or True
+        d.detach_device = lambda vid, pid, name: det.append((vid, pid)) or True
         s = d.Daemon()
-        s.devices[DP] = d.DeviceState(0x2DC8, 0x3106, present=True, attached=True)
+        s.devices[DP] = d.DeviceState(0x2DC8, 0x3106, present=True, home="testvm")
         s.reconcile()
-        ok = (not att and not det and s.devices[DP].attached is False)
+        ok = (not att and not det and s.devices[DP].home is None)
         results.append(("reconcile VM off releases state", ok,
                         "VM not running: reconcile must take no action and "
                         "mark devices unattached"))
@@ -438,7 +438,7 @@ def scenario_nonallowed_ignored():
     att = []
     DP = "/devices/nonallowed"
     try:
-        d.attach_device = lambda vid, pid: att.append((vid, pid)) or True
+        d.attach_device = lambda vid, pid, name: att.append((vid, pid)) or True
         fake_sysfs[DP] = True
         s = d.Daemon()
         s.handle_event({"action": "add", "DEVTYPE": "usb_device", "devpath": DP,
@@ -452,6 +452,248 @@ def scenario_nonallowed_ignored():
     finally:
         fake_sysfs.pop(DP, None)
         restore_mocks(saved)
+    return results
+
+
+def scenario_multi_vm_order():
+    """A device must attach to the first running VM in config order."""
+    results = []
+    saved = save_mocks()
+    DP = "/devices/mv"
+    try:
+        d.VM_NAMES = ["a", "b"]
+        d.pyudev = object()
+        d.detach_device = lambda vid, pid, name: None
+        d.scan_physical_devices = lambda: {DP: (0x05AC, 0x024F, 5, 8)}
+
+        # A running, B off -> attach to A
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", True, {}),
+                                  d.VMSnapshot("b", False, {})]
+        att_a = []
+        d.attach_device = lambda vid, pid, name: att_a.append(name) or True
+        s = d.Daemon()
+        s.reconcile()
+        got_a = att_a == ["a"]
+
+        # A off, B running -> attach to B
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", False, {}),
+                                  d.VMSnapshot("b", True, {})]
+        att_b = []
+        d.attach_device = lambda vid, pid, name: att_b.append(name) or True
+        s2 = d.Daemon()
+        s2.reconcile()
+        got_b = att_b == ["b"]
+
+        results.append(("multi-vm order", got_a and got_b,
+                        f"first running VM wins in order (A={att_a}, B={att_b})"))
+    finally:
+        restore_mocks(saved)
+    return results
+
+
+def scenario_multi_vm_no_migration():
+    """A device already healthy in a lower-priority running VM must NOT be
+    migrated to a higher-priority running VM."""
+    results = []
+    saved = save_mocks()
+    DP = "/devices/mv"
+    try:
+        d.VM_NAMES = ["a", "b"]
+        d.pyudev = object()
+        det, att = [], []
+        d.attach_device = lambda vid, pid, name: att.append(name) or True
+        d.detach_device = lambda vid, pid, name: det.append(name) or True
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", True, {}),
+                                  d.VMSnapshot("b", True, {(0x05AC, 0x024F): (5, 8)})]
+        d.scan_physical_devices = lambda: {DP: (0x05AC, 0x024F, 5, 8)}
+        s = d.Daemon()
+        s.devices[DP] = d.DeviceState(0x05AC, 0x024F, present=True, home="b")
+        s.reconcile()
+        results.append(("multi-vm no migration", not det and not att,
+                        f"healthy device in B must stay in B (det={det}, att={att})"))
+    finally:
+        restore_mocks(saved)
+    return results
+
+
+def scenario_multi_vm_stale_reentry():
+    """On re-enumeration the device's home VM holds a stale entry: it must be
+    cleared and re-attached to the SAME home (not the higher-priority VM)."""
+    results = []
+    saved = save_mocks()
+    DP = "/devices/mv"
+    try:
+        d.VM_NAMES = ["a", "b"]
+        d.pyudev = object()
+        det, att = [], []
+        d.attach_device = lambda vid, pid, name: att.append(name) or True
+        d.detach_device = lambda vid, pid, name: det.append(name) or True
+        # B resolved the device at (5,7); the device re-enumerated to (5,8)
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", True, {}),
+                                  d.VMSnapshot("b", True, {(0x05AC, 0x024F): (5, 7)})]
+        d.scan_physical_devices = lambda: {DP: (0x05AC, 0x024F, 5, 8)}
+        s = d.Daemon()
+        s.devices[DP] = d.DeviceState(0x05AC, 0x024F, present=True, home="b")
+        s.reconcile()
+        ok = det == ["b"] and att == ["b"]
+        results.append(("multi-vm stale reentry", ok,
+                        f"detach stale then re-attach to home B, not A "
+                        f"(det={det}, att={att})"))
+    finally:
+        restore_mocks(saved)
+    return results
+
+
+def scenario_multi_vm_unknown_defer():
+    """A higher-priority VM with unknown state must defer the action even when
+    a lower-priority VM is confirmed running."""
+    results = []
+    saved = save_mocks()
+    DP = "/devices/mv"
+    try:
+        d.VM_NAMES = ["a", "b"]
+        d.pyudev = object()
+        det, att = [], []
+        d.attach_device = lambda vid, pid, name: att.append(name) or True
+        d.detach_device = lambda vid, pid, name: det.append(name) or True
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", None, None),
+                                  d.VMSnapshot("b", True, {})]
+        d.scan_physical_devices = lambda: {DP: (0x05AC, 0x024F, 5, 8)}
+        s = d.Daemon()
+        s.reconcile()
+        results.append(("multi-vm unknown defer", not det and not att,
+                        f"higher-priority VM unknown must defer (det={det}, att={att})"))
+    finally:
+        restore_mocks(saved)
+    return results
+
+
+def scenario_multi_vm_dead_zombie():
+    """A physically absent allowed device still listed in several VMs must be
+    detached from every one of them."""
+    results = []
+    saved = save_mocks()
+    try:
+        d.VM_NAMES = ["a", "b"]
+        d.pyudev = object()
+        det, att = [], []
+        d.attach_device = lambda vid, pid, name: att.append(name) or True
+        d.detach_device = lambda vid, pid, name: det.append(name) or True
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", True, {(0x05AC, 0x024F): (5, 8)}),
+                                  d.VMSnapshot("b", True, {(0x05AC, 0x024F): (4, 3)})]
+        d.scan_physical_devices = lambda: {}  # device physically gone
+        s = d.Daemon()
+        s.reconcile()
+        ok = sorted(det) == ["a", "b"] and not att
+        results.append(("multi-vm dead zombie", ok,
+                        f"detach from every VM holding the absent device (det={det})"))
+    finally:
+        restore_mocks(saved)
+    return results
+
+
+def scenario_multi_vm_duplicate_sweep():
+    """A duplicate entry in another running VM must be cleaned even when the
+    home VM already holds the device healthy (no re-attach / churn)."""
+    results = []
+    saved = save_mocks()
+    DP = "/devices/mv"
+    try:
+        d.VM_NAMES = ["a", "b"]
+        d.pyudev = object()
+        det, att = [], []
+        d.attach_device = lambda vid, pid, name: att.append(name) or True
+        d.detach_device = lambda vid, pid, name: det.append(name) or True
+        # home B holds it healthy; higher-priority A also has a stale duplicate
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", True, {(0x05AC, 0x024F): (5, 8)}),
+                                  d.VMSnapshot("b", True, {(0x05AC, 0x024F): (5, 8)})]
+        d.scan_physical_devices = lambda: {DP: (0x05AC, 0x024F, 5, 8)}
+        s = d.Daemon()
+        s.devices[DP] = d.DeviceState(0x05AC, 0x024F, present=True, home="b")
+        s.reconcile()
+        ok = det == ["a"] and not att
+        results.append(("multi-vm duplicate sweep", ok,
+                        f"detach duplicate in A, keep healthy home B (det={det}, att={att})"))
+    finally:
+        restore_mocks(saved)
+    return results
+
+
+def scenario_multi_vm_first_running_wins():
+    """Selection always starts from the first VM: with no home memory (fresh
+    daemon), a device healthy in a lower-priority VM is re-assigned to the
+    first RUNNING VM, then stays there."""
+    results = []
+    saved = save_mocks()
+    DP = "/devices/mv"
+    try:
+        d.VM_NAMES = ["a", "b"]
+        d.pyudev = object()
+        det, att = [], []
+        d.attach_device = lambda vid, pid, name: att.append(name) or True
+        d.detach_device = lambda vid, pid, name: det.append(name) or True
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", True, {}),
+                                  d.VMSnapshot("b", True, {(0x05AC, 0x024F): (5, 8)})]
+        d.scan_physical_devices = lambda: {DP: (0x05AC, 0x024F, 5, 8)}
+        s = d.Daemon()
+        # home=None: fresh daemon -> re-select from the first VM
+        s.reconcile()
+        ok = det == ["b"] and att == ["a"]
+        results.append(("multi-vm first running wins", ok,
+                        f"fresh selection picks first running VM A "
+                        f"(det={det}, att={att})"))
+    finally:
+        restore_mocks(saved)
+    return results
+
+
+def scenario_multi_vm_reelect_on_stop():
+    """When the selected home VM stops running, the daemon re-elects: it
+    scans from the first VM again and picks the first running one (sticky
+    once re-elected)."""
+    results = []
+    saved = save_mocks()
+    DP = "/devices/mv"
+    try:
+        d.VM_NAMES = ["a", "b"]
+        d.pyudev = object()
+        att, det = [], []
+        d.attach_device = lambda vid, pid, name: att.append(name) or True
+        d.detach_device = lambda vid, pid, name: det.append(name) or True
+        d.scan_physical_devices = lambda: {DP: (0x05AC, 0x024F, 5, 8)}
+
+        s = d.Daemon()
+        # pass 1: A running, B off -> owner A
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", True, {}),
+                                  d.VMSnapshot("b", False, {})]
+        s.reconcile()
+        first = att == ["a"]
+
+        # pass 2: A stopped, B running -> re-elect to B (from first VM)
+        d.vm_snapshots = lambda: [d.VMSnapshot("a", False, {}),
+                                  d.VMSnapshot("b", True, {})]
+        s.reconcile()
+        second = att == ["a", "b"]
+
+        results.append(("multi-vm reelect on stop", first and second,
+                        f"owner moves A -> B once A stops (att={att}, det={det})"))
+    finally:
+        restore_mocks(saved)
+    return results
+
+
+def scenario_env_vm_list():
+    """USB_PT_VM comma-separated ordered list parsing (backward compatible)."""
+    results = []
+    results.append(("vm list parse",
+                    d._parse_vms(" a,b , c ") == ["a", "b", "c"],
+                    "comma-separated USB_PT_VM parses to an ordered, trimmed list"))
+    results.append(("vm list single",
+                    d._parse_vms("solo") == ["solo"],
+                    "a single VM name still parses to a one-element list"))
+    results.append(("vm list empty",
+                    d._parse_vms("") == [] and d._parse_vms(None) == [],
+                    "empty/missing USB_PT_VM parses to an empty list"))
     return results
 
 
@@ -518,6 +760,15 @@ def main():
     results += scenario_timer_same_key_dedupe()
     results += scenario_reconcile_vm_not_running()
     results += scenario_nonallowed_ignored()
+    results += scenario_multi_vm_order()
+    results += scenario_multi_vm_no_migration()
+    results += scenario_multi_vm_stale_reentry()
+    results += scenario_multi_vm_unknown_defer()
+    results += scenario_multi_vm_dead_zombie()
+    results += scenario_multi_vm_duplicate_sweep()
+    results += scenario_multi_vm_first_running_wins()
+    results += scenario_multi_vm_reelect_on_stop()
+    results += scenario_env_vm_list()
     results += scenario_env_strict()
     return 1 if report(results) else 0
 
