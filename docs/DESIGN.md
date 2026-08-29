@@ -231,9 +231,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 **为什么**：libvirtd 重启后旧连接会失效，缓存连接就得自己写"断线检测 + 重连"逻辑。每次动作现开现关（`_open()`：查询用 `openReadOnly`，attach/detach 用读写连接），libvirtd 重启天然在**下一次调用**自愈——正好落在"状态未知 → 跳过 → 对账重试"的既有框架里，无需任何重连代码。
 
-**为什么补 keepalive**（`conn.setKeepAlive(5, 3)`）：绑定是同步 RPC、无超时参数——virsh 时代 `subprocess.run` 有 15s timeout，libvirtd 假死时绑定调用会无限阻塞导致 select 循环卡死。keepalive 让死连接在几轮探测后报错返回（≈15s 内），恢复与 virsh 时代等同的"最坏阻塞上限"。
-
-**前提（实测踩坑）**：必须先注册事件循环实现 `libvirt.virEventRegisterDefaultImpl()`（模块导入时执行一次；内置 poll 实现，单线程下随阻塞 RPC 运转），否则 setKeepAlive 报 `the caller doesn't support keepalive protocol`、keepalive 失效，且 **每次连接** libvirt 都向 stderr 刷一遍该错误。
+**为什么不用 keepalive**（`setKeepAlive`，也不注册 `virEventRegisterDefaultImpl`）：keepalive 依赖一个**持续运转**的事件循环（`virEventRunDefaultImpl()` 要在循环里跑），但本守护进程是单线程、只在短促的同步 RPC 里阻塞，从不泵事件循环。注册了默认 poll 实现后，每条连接的 keepalive 定时器只有在该循环运行时才会被回收；开开/关关却不跑循环，会导致**每次连接关闭都漏掉文件描述符**，进程最终耗尽 fd 表，报 `Too many open files`（EMFILE，errno 24）——libvirt 连 `open()` 读 `/etc/libvirt/libvirt.conf` 都失败、pyudev `poll()` 也一起失败，正是本项目真机踩过的坑。加上这些连接只存活毫秒级（keepalive 5s 一探，根本来不及触发），而 libvirtd 宕机/重启在 `open()` 阶段就快速失败 → "状态未知 → 跳过"，keepalive 在这里既无效又只带来 fd 泄漏，故不启用。
 
 ### 8.6 状态与配置一次读完（`vm_snapshot()`）
 
@@ -327,7 +325,7 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 | 函数 | 职责 / 关键点 |
 |---|---|
-| `_open(readonly)` | **短生命期连接**（§8.5）：现开现关，libvirtd 重启在下一次调用自愈；查询走 `openReadOnly`，attach/detach 走读写连接；带 keepalive 防阻塞；bindings 缺失/libvirtd 不可达 → `None`（= 状态未知） |
+| `_open(readonly)` | **短生命期连接**（§8.5）：现开现关，libvirtd 重启在下一次调用自愈；查询走 `openReadOnly`，attach/detach 走读写连接；**不用 keepalive / 不注册事件循环**（避免 fd 泄漏，见 §8.5）；bindings 缺失/libvirtd 不可达 → `None`（= 状态未知） |
 | `_conn(readonly)` | contextmanager 包装 `_open()`：with 块结束担保 `close()`；连接开失败时 yield `None` |
 | `vm_snapshot(name)` | **单只读连接**返回单台 VM 的 `(running, attached)`（§8.6）：`dom.state()[0]==VIR_DOMAIN_RUNNING` + `dom.XMLDesc(0)`（仅运行中读配置）；两维失败独立返回 `None`；非 running 打印 `VM ... not running (state=...)`；**`VIR_ERR_NO_DOMAIN`（名字不存在）视为「确定未运行」返回 `(False,{})`**，不算未知 |
 | `VMSnapshot` / `vm_snapshots()` | `VMSnapshot` = `(name, running, attached)` dataclass；`vm_snapshots()` 按 `VM_NAMES` 顺序逐台 `vm_snapshot(name)` 合成全量快照（每台一个短只读连接，§8.6 单机不变量不变） |

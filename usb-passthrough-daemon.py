@@ -58,15 +58,6 @@ try:
     import libvirt  # noqa: F401
 except ImportError:
     libvirt = None
-else:
-    # Without a registered event-loop implementation setKeepAlive() fails
-    # with "the caller doesn't support keepalive protocol" (libvirt also
-    # logs it to stderr on EVERY connection). The default impl is poll-based
-    # and runs inside blocking RPCs — right for this single-threaded daemon.
-    try:
-        libvirt.virEventRegisterDefaultImpl()
-    except libvirt.libvirtError:
-        pass  # registration failed: keepalive gets skipped in _open()
 
 # ---------------------------------------------------------------------------
 # Types
@@ -160,15 +151,19 @@ def _open(readonly: bool = False):
         return None
     try:
         opener = libvirt.openReadOnly if readonly else libvirt.open
-        conn = opener(None)
-        # dead-peer detection for blocking RPCs: error out within a few
-        # keepalive rounds instead of letting a hung libvirtd stall the
-        # select loop forever (mirrors the old virsh subprocess timeout)
-        try:
-            conn.setKeepAlive(5, 3)
-        except (libvirt.libvirtError, AttributeError):
-            pass  # very old libvirt without keepalive: accept the risk
-        return conn
+        # Deliberately NO keepalive (setKeepAlive) and NO libvirt event-loop
+        # registration (virEventRegisterDefaultImpl). Keepalive requires an
+        # event loop that is pumped continuously, but this single-threaded
+        # daemon only ever blocks in short, synchronous RPCs and never runs
+        # virEventRunDefaultImpl(). With the default impl registered, each
+        # connection's keepalive timer is only reaped when that loop runs;
+        # opening/closing connections without running it leaks fds until the
+        # process exhausts its fd table (EMFILE "Too many open files"). A
+        # dead/restarting libvirtd already fails fast at open() -> "state
+        # unknown" -> skip, and these connections live for milliseconds, so
+        # keepalive (which pings on a 5s interval) never gets a chance to
+        # fire here anyway.
+        return opener(None)
     except libvirt.libvirtError as e:
         log.error("libvirt connection failed: %s", e)
         return None

@@ -50,8 +50,8 @@
    - 对账成功后需取消该设备残留的 settle 定时器，避免 detach+attach 抖动
 
 6. **libvirt 调用规范**（python3-libvirt 绑定，无 virsh 子进程）：
-   - **短生命期连接**：每次调用 `_open()` 现开现关（查询 `openReadOnly`、attach/detach 读写连接，均带 keepalive——挂死的 libvirtd 快速失败不卡 select 循环；contextmanager `_conn()` 负责关闭），libvirtd 重启在下一次调用天然自愈；连接失败 = 状态未知 → 返回 `None`/`False`，等对账
-   - **keepalive 前提**：模块导入时必须先 `libvirt.virEventRegisterDefaultImpl()`，否则每次连接 stderr 刷 "caller doesn't support keepalive protocol" 且 keepalive 失效
+   - **短生命期连接**：每次调用 `_open()` 现开现关（查询 `openReadOnly`、attach/detach 读写连接；contextmanager `_conn()` 负责关闭），libvirtd 重启在下一次调用天然自愈；连接失败 = 状态未知 → 返回 `None`/`False`，等对账
+   - **禁用 keepalive**：不要 `setKeepAlive`，也不要注册 `virEventRegisterDefaultImpl()`——keepalive 依赖持续运行的 `virEventRunDefaultImpl()`，本守护进程单线程从不泵它，注册后每条连接关闭都漏 fd，最终耗尽 fd 表报 `Too many open files`（EMFILE）
    - **状态+配置一次读完**：查询统一走 `vm_snapshot()` → `(running, attached)`（单只读连接；配置 = `dom.XMLDesc(0)` + `_parse_hostdev_map` 解析），调用方把 attached map 传下去共享，禁止每设备重读配置
    - `import libvirt` 守卫导入（测试环境无库也能加载模块），`run()` 里缺失拒绝启动；**版本必须与 libvirtd 配对，用发行版包装，禁 pip**
    - hostdev XML **只按 vendor/product 匹配，不加 `<address>`**（宿主侧地址绑定 DEVNUM，重枚举必失效）
@@ -103,7 +103,7 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 | pip 装 python3-libvirt | 用发行版包（版本必须与 libvirtd 配对） |
 | 缓存 libvirt 连接跨 libvirtd 重启 | 短连接现开现关，失败当"状态未知" |
 | 以为 python 绑定暴露 `listHostdevs`（C API 5.7 起有） | 实测无该属性（libvirtd 12.0.0）——用 `XMLDesc(0)` + 解析 |
-| 没注册事件循环就 `setKeepAlive` | 导入时 `virEventRegisterDefaultImpl()`，否则每次连接 stderr 刷错且 keepalive 失效 |
+| 给连接加 keepalive + 注册事件循环却不跑循环 | 禁用 keepalive / 不注册 `virEventRegisterDefaultImpl()`，否则每条连接关闭都漏 fd → `Too many open files` |
 | 把 `vm_snapshot()` 的 `running=None` 当"没运行" | `None` = 状态未知，绝不动作 |
 | 对账只看"设备在不在 VM 配置" | 必须做地址比对，检测失效条目 |
 | 写死默认 VM 名/设备 | 只从环境变量读，必填缺失拒绝启动 |
