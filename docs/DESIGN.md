@@ -233,6 +233,8 @@ libvirt 自动处理"从宿主驱动解绑 / 归还时回绑"，直通动作不�
 
 **为什么不用 keepalive**（`setKeepAlive`，也不注册 `virEventRegisterDefaultImpl`）：keepalive 依赖一个**持续运转**的事件循环（`virEventRunDefaultImpl()` 要在循环里跑），但本守护进程是单线程、只在短促的同步 RPC 里阻塞，从不泵事件循环。注册了默认 poll 实现后，每条连接的 keepalive 定时器只有在该循环运行时才会被回收；开开/关关却不跑循环，会导致**每次连接关闭都漏掉文件描述符**，进程最终耗尽 fd 表，报 `Too many open files`（EMFILE，errno 24）——libvirt 连 `open()` 读 `/etc/libvirt/libvirt.conf` 都失败、pyudev `poll()` 也一起失败，正是本项目真机踩过的坑。加上这些连接只存活毫秒级（keepalive 5s 一探，根本来不及触发），而 libvirtd 宕机/重启在 `open()` 阶段就快速失败 → "状态未知 → 跳过"，keepalive 在这里既无效又只带来 fd 泄漏，故不启用。
 
+**为什么显式释放 `dom`**：Python 侧 `virDomain` 对象持有对所属 `virConnect` 的引用；若它在连接 `close()` 之后才被 GC 回收，连接无法干净关闭、libvirt 会报 `One or more references were leaked after disconnect from the hypervisor`（并推迟 socket 释放）。因此 `vm_snapshot()` 在读完 `dom.state()`/`dom.XMLDesc(0)` 后、`with` 退出前显式 `del dom`，保证 `_conn` 的 `close()` 干净关闭。attach/detach 里的 `conn.lookupByName(name).xxx(...)` 是临时对象，表达式结束即释放，无此问题。
+
 ### 8.6 状态与配置一次读完（`vm_snapshot()`）
 
 `vm_running()` + `vm_attached_devices()` 合并为 `vm_snapshot() -> (running, attached)`：**单只读连接**一次取 `dom.state()` + `dom.XMLDesc(0)`（仅 VM 运行中才读配置——VM 关闭时配置与决策无关，省一次 RPC）。两个用途（决策运行态、比对配置）的调用点几乎所有场景都同时需要两者，合并后从 2 次连接握手降为 1 次。

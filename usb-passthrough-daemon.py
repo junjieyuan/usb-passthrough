@@ -214,6 +214,10 @@ def vm_snapshot(name: str) -> tuple[bool | None, AttachedMap | None]:
         running = state == libvirt.VIR_DOMAIN_RUNNING
         if not running:
             log.info("VM %s not running (state=%s)", name, state)
+            # Drop `dom` before `_conn` closes the connection: a virDomain
+            # holds a reference to its virConnect, so leaving it alive makes
+            # close() report "references leaked" and postpone socket teardown.
+            del dom
             # config stays unread: it is irrelevant while the VM is off and
             # no caller consumes the map in that case
             return running, {}
@@ -223,7 +227,9 @@ def vm_snapshot(name: str) -> tuple[bool | None, AttachedMap | None]:
             xml = dom.XMLDesc(0)
         except libvirt.libvirtError as e:
             log.error("cannot read config of VM %s: %s", name, e)
+            del dom  # release before conn.close() (see not-running branch)
             return running, None
+        del dom  # release before conn.close() (see not-running branch)
         attached = _parse_hostdev_map(xml)
     log.debug("vm snapshot %s: running=%r, attached=%r", name, running, attached)
     return running, attached
