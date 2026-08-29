@@ -78,18 +78,19 @@ Environment=USB_PT_IDLE=2dc8:3109
 
 ---
 
-## 6. 与 virt-manager 配合
+## 6. 与 virt-manager 配合（2026-08-29 修订：持久配置已弃用）
 
-实际用法是"virt-manager 持久直通 + 宿主蓝牙逃生"，这正是本守护进程设计的使用方式：
+**当前推荐用法：删除 VM 持久配置里的全部 USB hostdev，纯靠守护进程直通。** 原"保留 virt-manager 持久 hostdev 配置"的用法已被真机日志证伪，原因见本节约末。
 
-- **保留 virt-manager 里的持久 hostdev 配置**（不要删）——VM 开机时 libvirt 自动直通，这就是"虚拟机开机就能用"；
-- **守护进程负责恢复**：键盘切蓝牙断开 USB、再切回 USB 后，virt-manager 不会重新直通（libvirt 的 hostdev 条目在设备物理重枚举后变成失效条目，不会自动恢复）——守护进程在 `add` 事件后自动"先清掉失效条目再重新直通"；
-- 守护进程与持久配置**不冲突**：attach/detach 都只加 `--live`（不动持久配置），动作前先查 VM 当前配置，幂等，不会重复直通；
-- **检查 virt-manager 生成的 hostdev XML**，区分两种 `<address>`：
+- **持久配置全部删除后，设备直通全由守护进程接管**：设备插着时，VM 开机后 ≤30s 对账补直通；想"开机立即直通"就加 libvirt qemu hook（`/etc/libvirt/hooks/qemu` 在 `started` 时执行 `--reconcile-once`，见 §11.2）；
+- **守护进程只动运行态**：attach/detach 都只用 `--live`（`VIR_DOMAIN_AFFECT_LIVE`），动作前先查 VM 当前配置，幂等，不会重复直通；
+- **如果仍要保留持久配置**（例如某些设备实测开机直通正常），注意检查 virt-manager 生成的 hostdev XML，区分两种 `<address>`：
   - `<source>` **里面**的 `<address type='usb' bus='..' device='..'/>` 是**宿主侧**地址（对应 /dev/bus/usb 的 DEVNUM），重枚举后必然失效——**必须删掉**，只按 `<vendor>`/`<product>` 匹配；
   - `<hostdev>` 外层（`<source>` 的兄弟）的 `<address type='usb' bus='0' port='N'/>` 是**客户机侧**端口（设备出现在 Windows 模拟 USB 总线的哪个口），不会失效，可留可删；多个设备端口别重复，想省心就删掉让 QEMU 自动分配。
 
-**K6 事件流走查（VM 运行中）**：切蓝牙 → 拔线 → remove → 去抖 → `detach-device --live`（K6 回宿主蓝牙）；切回 USB → 插线 → add → settle → 清失效条目 → `attach-device --live` → Windows 重新识别 K6。
+**为什么不再保留持久配置（真机日志证据，2026-08-29）**：libvirt 开机按持久配置直通键盘（Keychron K6 `05ac:024f`）与鼠标（Razer Basilisk `1532:0083`）时，QEMU 在 usbfs 层拿不到接口——dmesg 反复出现 `usb 5-2.1.X: usbfs: process ... (CPU 15/KVM) did not claim interface 0/1(/2) before use`，伴随设备被反复 reset、宿主 HID 驱动反复重新绑定（新 `input` 设备不断出现），最终设备**实际留在宿主机**，VM 里"看得到但用不了"。守护进程对账也救不回来：libvirt 的 attach 在 libvirt 层面"成功"（live XML 留下地址一致的条目），对账地址比对判"健康"跳过。键盘（2 接口）、鼠标（3 接口）先后实测中招，与设备型号无关——问题出在"开机持久直通"这条路径本身（reset 后宿主驱动重新绑定与 QEMU usbfs claim 的竞态）。唯一可靠临时恢复 = 物理开关键盘/插拔设备（触发 remove/add，走守护进程事件路径重新直通）；根治 = 删除全部持久 USB hostdev，纯靠守护进程（见 §11.2）。
+
+**K6 事件流走查（VM 运行中，纯 daemon 模式）**：切蓝牙 → 拔线 → remove → 去抖 → `detach-device --live`（K6 回宿主蓝牙）；切回 USB → 插线 → add → settle → 清失效条目 → `attach-device --live` → Windows 重新识别 K6。
 
 ---
 
@@ -194,10 +195,11 @@ Environment=USB_PT_IDLE=2dc8:3109
 - **键盘/鼠标直通给 VM 后宿主机没有 USB 输入**——这是设计内行为，宿主用蓝牙模式操作。注意两台设备的切换行为不同：
   - **Razer 鼠标**：蓝牙↔2.4G 开关切换**不产生任何 udev 事件**（dongle 始终保持 USB 枚举）。切到蓝牙后，dongle **不会**自动从 VM 取消直通，而是留在 VM 里变成"空闲"设备，宿主通过蓝牙获得鼠标；切回 2.4G 时鼠标直接重连 VM 里的 dongle，无掉线。**VM 运行期间 dongle 归 VM 所有**：想在宿主用 2.4G 模式，只能停 VM 或手动 `virsh detach-device`（但 30s 对账会把它重新直通回去）——**宿主请用蓝牙**。
   - **Keychron K6**：切蓝牙需要拔 USB 线 → 真实 remove 事件 → 自动取消直通；插回 → add → 自动重新直通（若 VM 在运行）。
+- **libvirt 开机"持久配置直通"在部分设备上不可靠——usbfs claim 竞态（作者实测：键盘、鼠标先后中招）**：VM 开机时 libvirt 按持久 hostdev 自动直通，QEMU 在 usbfs 层报 `usbfs: process ... (CPU 15/KVM) did not claim interface 0/1(/2) before use`（键盘 2 接口、鼠标 3 接口都报），设备被反复 reset、宿主 HID 驱动反复重新绑定（dmesg 里新 `input` 设备不断出现），最终设备**实际留在宿主机**，VM 里"看得到但用不了"。守护进程对账救不回来：libvirt 的 attach 在 libvirt 层面"成功"（live XML 留下地址一致的条目），对账地址比对判"健康"跳过——这是地址比对盲区（"libvirt 以为挂上、实际没挂上"）。**临时恢复**：物理开关键盘/插拔设备（触发 remove/add，走守护进程事件路径重新直通）；**根治**：删除 VM 持久配置里的全部 USB hostdev，纯靠守护进程直通（见 §6）。判定依据：dmesg 中同一时刻，还在持久配置里的鼠标出现上述报错，已删除配置的键盘零异常、由守护进程干净直通。
 - **同一 VID:PID 的多台设备无法区分**（如两个同型号手柄），直通会匹配第一台。需要精确到端口时，把 `hostdev_xml()` 生成的 XML 加上 `<address type='usb' bus='..' device='..'/>`（但 DEVNUM 变化会使其失效，需配合对账刷新）。
 - **Windows 侧**：设备每次物理重枚举（8BitDo 模式切换、休眠唤醒、拔插）都会掉线重连一次，这是 USB 物理行为，无法避免；本守护进程保证不放大抖动、不误取消。Razer 鼠标切开关不重枚举，Windows 里无掉线。
-- **对账的覆盖边界**：30s 对账清理"已直通但物理已不存在"的僵尸条目；并通过**地址比对**恢复"重枚举后残留失效条目"（VM 条目记录的 bus/device ≠ 设备当前值 → 判定失效 → 先清再挂）。所以即使守护进程晚启动、或停机期间漏了 add 事件，设备在位也能被对账重新直通。仅剩的盲区：条目地址缺失（无 `<address>`）时保守跳过，靠下次重插/VM 重启收敛。
-- **可选增强**：想"VM 一启动就立即直通"而不是等 ≤30s 的对账，可加一个 libvirt qemu hook（`/etc/libvirt/hooks/qemu`）在 `started` 时执行 `--reconcile-once`。
+- **对账的覆盖边界**：30s 对账清理"已直通但物理已不存在"的僵尸条目；并通过**地址比对**恢复"重枚举后残留失效条目"（VM 条目记录的 bus/device ≠ 设备当前值 → 判定失效 → 先清再挂）。所以即使守护进程晚启动、或停机期间漏了 add 事件，设备在位也能被对账重新直通。盲区有两个：(1) 条目地址缺失（无 `<address>`）时保守跳过，靠下次重插/VM 重启收敛；(2) **"libvirt 以为挂上、实际没挂上"的坏状态**（开机持久直通失败但 live XML 留下地址一致的条目，见上）——地址比对识别不了，只能靠物理插拔触发事件路径，或直接不用持久配置。
+- **可选增强（纯 daemon 模式下推荐）**：想"VM 一启动就立即直通"而不是等 ≤30s 的对账，可加一个 libvirt qemu hook（`/etc/libvirt/hooks/qemu`）在 `started` 时执行 `--reconcile-once`。
 
 ---
 

@@ -90,9 +90,10 @@ sudo dnf install python3-pyudev python3-libvirt   # Arch: sudo pacman -S python-
 
 ## 与 virt-manager 配合（推荐用法）
 
-- 可保留 virt-manager 里的持久 hostdev 配置（VM 开机时 libvirt 自动直通）——**不冲突**：守护进程的 attach/detach 都只用 `--live`（绑定对应 `VIR_DOMAIN_AFFECT_LIVE`，不动持久配置），动作前先查 VM 当前配置，幂等；
-- 守护进程负责**运行期恢复**：设备物理重枚举后，virt-manager 不会自动重新直通（libvirt 的 hostdev 条目在设备重枚举后变成失效条目，不会自愈）——守护进程在 `add` 事件后自动"先清掉失效条目再重新直通"；
-- 检查持久 hostdev XML 时区分两种 `<address>`：
+- **推荐：删除 VM 持久配置里的全部 USB hostdev，纯靠守护进程直通**。作者真机实测 libvirt 开机"持久配置直通"在部分设备上不可靠（usbfs claim 竞态，键盘、鼠标先后中招，详见 `docs/AUTHOR_DEPLOYMENT.md` §6/§11.2）；守护进程的 `--live` 直通路径实测干净；
+- 守护进程的 attach/detach 都只用 `--live`（对应 `VIR_DOMAIN_AFFECT_LIVE`，不动持久配置），动作前先查 VM 当前配置，幂等；
+- 设备物理重枚举后 virt-manager 不会自动重新直通（libvirt 的 hostdev 条目在设备重枚举后变成失效条目，不会自愈）——守护进程在 `add` 事件后自动"先清掉失效条目再重新直通"；
+- 若仍保留持久 hostdev，检查 XML 时区分两种 `<address>`：
   - `<source>` **里面**的 `<address type='usb' bus='..' device='..'/>` 是**宿主侧**地址（对应 /dev/bus/usb 的 DEVNUM），重枚举后必然失效——**必须删掉**，只按 `<vendor>`/`<product>` 匹配；
   - `<hostdev>` 外层（`<source>` 的兄弟）的 `<address type='usb' bus='0' port='N'/>` 是**客户机侧**端口（设备出现在客户机模拟 USB 总线的哪个口），不会失效，可留可删；多个设备端口别重复，想省心就删掉让 QEMU 自动分配。
 - 特定设备的完整恢复流程与事件流走查见 `docs/AUTHOR_DEPLOYMENT.md`。
@@ -136,7 +137,8 @@ sudo /usr/local/sbin/usb-passthrough-daemon.py --reconcile-once --debug
 ## 注意事项 / 已知限制
 
 - **设备直通给 VM 后宿主机没有该 USB 输入**——这是设计内行为，宿主用其它方式（如蓝牙/无线）操作。具体设备的切换行为差异见 `docs/AUTHOR_DEPLOYMENT.md`。
+- **libvirt 开机"持久配置直通"在部分设备上不可靠（usbfs claim 竞态，作者实测键盘、鼠标先后中招）**：开机直通时 dmesg 反复出现 `usbfs: ... did not claim interface 0/1(/2) before use`，设备被反复 reset、宿主 HID 驱动反复重新绑定，最终留在宿主机、VM 里"看得到但用不了"；守护进程对账因"live XML 地址一致"判健康而跳过。**根治：删除 VM 持久配置里的全部 USB hostdev，纯靠守护进程直通**（详见 `docs/AUTHOR_DEPLOYMENT.md` §6/§11.2）。
 - **同一 VID:PID 的多台设备无法区分**（如两个同型号设备），直通会匹配第一台。需要精确到端口时，可在 `hostdev_xml()` 生成的 XML 加上 `<address type='usb' bus='..' device='..'/>`（但 DEVNUM 变化会使其失效，需配合对账刷新）。
 - **客户机侧**：设备每次物理重枚举（模式切换、休眠唤醒、拔插）都会掉线重连一次，这是 USB 物理行为，无法避免；本守护进程保证不放大抖动、不误取消。
-- **对账的覆盖边界**：30s 对账清理"已直通但物理已不存在"的僵尸条目；并通过**地址比对**恢复"重枚举后残留失效条目"（VM 条目记录的 bus/device ≠ 设备当前值 → 判定失效 → 先清再挂）。所以即使守护进程晚启动、或停机期间漏了 add 事件，设备在位也能被对账重新直通。仅剩的盲区：条目地址缺失（无 `<address>`）时保守跳过，靠下次重插/VM 重启收敛。
-- **可选增强**：想"VM 一启动就立即直通"而不是等 ≤30s 的对账，可加一个 libvirt qemu hook（`/etc/libvirt/hooks/qemu`）在 `started` 时执行 `--reconcile-once`。
+- **对账的覆盖边界**：30s 对账清理"已直通但物理已不存在"的僵尸条目；并通过**地址比对**恢复"重枚举后残留失效条目"（VM 条目记录的 bus/device ≠ 设备当前值 → 判定失效 → 先清再挂）。所以即使守护进程晚启动、或停机期间漏了 add 事件，设备在位也能被对账重新直通。盲区有两个：(1) 条目地址缺失（无 `<address>`）时保守跳过，靠下次重插/VM 重启收敛；(2) **"libvirt 以为挂上、实际没挂上"的坏状态**（开机持久直通失败但 live XML 留下地址一致的条目）——地址比对识别不了，只能靠物理插拔触发事件路径，或直接不用持久配置（见上一条）。
+- **可选增强（纯 daemon 模式下推荐）**：想"VM 一启动就立即直通"而不是等 ≤30s 的对账，可加一个 libvirt qemu hook（`/etc/libvirt/hooks/qemu`）在 `started` 时执行 `--reconcile-once`。

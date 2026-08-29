@@ -13,7 +13,7 @@
 - 事件驱动（秒级响应）+ 对账兜底（最终一致性，≤30s 收敛）
 - **状态未知时绝不动作**：`vm_snapshot()` 返回 `running=None` 时宁可跳过等下次对账，绝不误 attach/detach
 - 一切动作幂等、容错，靠对账收敛
-- 只动运行态（`--live`），不碰持久配置，与 virt-manager 分工
+- 只动运行态（`--live`），不碰持久配置；**开机直通默认不再依赖 virt-manager 持久配置**（真机实测 libvirt 开机持久直通有 usbfs claim 竞态，键盘、鼠标先后中招，见 docs/AUTHOR_DEPLOYMENT.md §6/§11.2），作者部署为纯守护进程接管
 
 ---
 
@@ -55,7 +55,7 @@
    - **状态+配置一次读完**：查询统一走 `vm_snapshot()` → `(running, attached)`（单只读连接；配置 = `dom.XMLDesc(0)` + `_parse_hostdev_map` 解析），调用方把 attached map 传下去共享，禁止每设备重读配置
    - `import libvirt` 守卫导入（测试环境无库也能加载模块），`run()` 里缺失拒绝启动；**版本必须与 libvirtd 配对，用发行版包装，禁 pip**
    - hostdev XML **只按 vendor/product 匹配，不加 `<address>`**（宿主侧地址绑定 DEVNUM，重枚举必失效）
-   - 只用 `--live`（绑定对应 `VIR_DOMAIN_AFFECT_LIVE`，不碰持久配置，与 virt-manager 各管一摊：开机直通归持久配置，运行期恢复归守护进程）
+   - 只用 `--live`（绑定对应 `VIR_DOMAIN_AFFECT_LIVE`，不碰持久配置）；**开机直通不再默认依赖 virt-manager 持久配置**（usbfs claim 竞态，见项目概览与 docs/AUTHOR_DEPLOYMENT.md §6/§11.2），作者部署为纯守护进程接管
 
 7. **配置**：**全部来自环境变量，代码零硬编码设备/VM 名**。`USB_PT_VM` 与 `USB_PT_ALLOWED` 必填，缺失拒绝启动（非零退出）。
 
