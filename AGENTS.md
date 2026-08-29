@@ -104,6 +104,7 @@ sudo USB_PT_VM=myvm USB_PT_ALLOWED=1234:5678 \
 | 缓存 libvirt 连接跨 libvirtd 重启 | 短连接现开现关，失败当"状态未知" |
 | 以为 python 绑定暴露 `listHostdevs`（C API 5.7 起有） | 实测无该属性（libvirtd 12.0.0）——用 `XMLDesc(0)` + 解析 |
 | 给连接加 keepalive + 注册事件循环却不跑循环 | 禁用 keepalive / 不注册 `virEventRegisterDefaultImpl()`，否则每条连接关闭都漏 fd → `Too many open files` |
+| libvirt 子对象（`virDomain`）活过 `conn.close()` | 连接 close 前显式 `del dom`，否则报 `references were leaked` |
 | 把 `vm_snapshot()` 的 `running=None` 当"没运行" | `None` = 状态未知，绝不动作 |
 | 对账只看"设备在不在 VM 配置" | 必须做地址比对，检测失效条目 |
 | 写死默认 VM 名/设备 | 只从环境变量读，必填缺失拒绝启动 |
