@@ -108,7 +108,7 @@ python3 test_replay.py
 | pip 装 `python3-libvirt` | 用**发行版包**装（版本必须与 libvirtd 配对，pip 版本错配会 ABI 报错；见 DESIGN.md §8.2） |
 | 缓存 libvirt 连接跨 libvirtd 重启复用 | 每次调用开**短连接**现开现关——libvirtd 重启在下一次调用天然自愈，无需重连逻辑（DESIGN.md §8.5） |
 | 以为 python 绑定暴露 `listHostdevs()`（C API 5.7 起有 `virDomainListHostdevs`） | 实测 `'virDomain' object has no attribute 'listHostdevs'`（libvirtd 12.0.0）——绑定不暴露，用 **`XMLDesc(0)` + `_parse_hostdev_map` 解析**（DESIGN.md §8.2 决策记录） |
-| 直接 `setKeepAlive` 不注册事件循环 | 模块导入时先 `libvirt.virEventRegisterDefaultImpl()`，否则每次连接 stderr 刷 "caller doesn't support keepalive protocol" 且 keepalive 失效 |
+| 给短生命期连接加 keepalive（`setKeepAlive`）+ 注册 `virEventRegisterDefaultImpl` 却不跑事件循环 | **不要用 keepalive / 不注册事件循环**。keepalive 依赖持续运行的 `virEventRunDefaultImpl()`；本守护进程单线程从不泵它，注册后每条连接关闭都会**漏 fd**，进程最终耗尽 fd 表报 `Too many open files`（EMFILE）——libvirt `open()` 与 pyudev `poll()` 一起失败。连接只活毫秒级，keepalive 根本来不及触发；libvirtd 宕机在 `open()` 就快速失败 → 状态未知跳过（DESIGN.md §8.5） |
 | 把 `vm_snapshot()` 的 `running=None` 当"没运行" | **`None` = 状态未知，绝不动作**（attach/detach 都跳过，等对账） |
 | 用 `dev.get()`（pyudev） | 用 **`dev.properties.get()`**（0.24.1 起弃用，1.0 移除） |
 | 对账只看"设备在不在 VM 配置里" | 还要**地址比对**（配置里有条目 ≠ 可用——设备重枚举后条目是死的） |
